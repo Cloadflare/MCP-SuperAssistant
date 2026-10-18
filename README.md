@@ -12,6 +12,7 @@ Brings MCP to ChatGPT, Perplexity, Grok, Gemini, Google AI Studio, OpenRouter, K
    <a href="https://mcpsuperassistant.ai/" target="_blank"><strong>🌐 Visit Official Website</strong></a>
 </p>
 
+
 <!-- ![MCP SuperAssistant](chrome-extension/public/Cover3.jpg) -->
 <div align="center">
  <img src="chrome-extension/public/Cover5.jpg" alt="MCP SuperAssistant Cover" width="800">
