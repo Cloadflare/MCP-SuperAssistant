@@ -20,14 +20,14 @@ const packageJson = JSON.parse(readFileSync('./package.json', 'utf8'));
 const manifest = {
   manifest_version: 3,
   default_locale: 'en',
-  name: 'MCP SuperAssistant',
+  name: 'Gtex AI',
   browser_specific_settings: {
     gecko: {
-      id: 'saurabh@mcpsuperassistant.ai',
+      id: 'saurabh@gtexmarket.com',
     },
   },
   version: packageJson.version,
-  description: 'MCP SuperAssistant',
+  description: 'Gtex AI',
   host_permissions: [
     '*://*.perplexity.ai/*',
     '*://*.chat.openai.com/*',
