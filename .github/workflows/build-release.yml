@@ -1,0 +1,72 @@
+name: Build And Release Extension
+
+on:
+  push:
+    branches: ['**']
+
+permissions:
+  contents: write
+
+# A single rolling release is updated by every push, so serialize the runs
+# to avoid two builds racing to publish the same release.
+concurrency:
+  group: release-latest-build
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    name: Build and publish extension
+    runs-on: ubuntu-latest
+    env:
+      CEB_CI: true
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Build extension zip
+        run: pnpm zip
+
+      - name: Read extension version
+        id: pkg
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # The zipper emits a timestamped name, which would pile up as a new asset
+      # on every push. Rename it to a stable name so the rolling release always
+      # carries exactly one downloadable file.
+      - name: Prepare release asset
+        run: |
+          mkdir -p release
+          cp "$(ls -t dist-zip/*.zip | head -n 1)" release/mcp-superassistant-extension.zip
+          ls -lh release
+
+      - name: Publish rolling prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-build
+          name: Latest Build
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: release/mcp-superassistant-extension.zip
+          body: |
+            Automated build of the extension from the latest push.
+
+            | | |
+            | --- | --- |
+            | Version | `${{ steps.pkg.outputs.version }}` |
+            | Branch | `${{ github.ref_name }}` |
+            | Commit | `${{ github.sha }}` |
+            | Built at | ${{ github.event.head_commit.timestamp }} |
+
+            Download `mcp-superassistant-extension.zip` below, then load it as an
+            unpacked extension (`chrome://extensions` → Developer mode → Load unpacked).
