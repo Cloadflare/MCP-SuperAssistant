@@ -818,9 +818,6 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
                   <div className="mb-2">
                     <strong>To start Gtex AI Proxy:</strong>
                   </div>
-                  <div className="bg-slate-100 dark:bg-slate-800 p-2 rounded font-mono text-xs border">
-                    npx @srbhptl39/mcp-superassistant-proxy@latest --config ./config.json --outputTransport {connectionType === 'sse' ? 'sse' : connectionType === 'websocket' ? 'ws' : 'streamableHttp'}
-                  </div>
                   <div className="mt-2 text-xs">
                     <div className="mb-1">
                       Available transports: <code>streamableHttp</code>, <code>sse</code>, <code>ws</code>
