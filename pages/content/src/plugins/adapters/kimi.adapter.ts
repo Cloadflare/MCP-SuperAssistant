@@ -1,5 +1,6 @@
 import { BaseAdapterPlugin } from './base.adapter';
-import type { AdapterCapability, PluginContext } from '../plugin-types';
+import type { AdapterCapability, PluginContext, ChipAnchors } from '../plugin-types';
+import { inputChips } from '../../services/input-chips';
 import { createLogger } from '@extension/shared/lib/logger';
 
 /**
@@ -17,7 +18,7 @@ const logger = createLogger('KimiAdapter');
 export class KimiAdapter extends BaseAdapterPlugin {
   readonly name = 'KimiAdapter';
   readonly version = '2.0.0'; // Incremented for new architecture
-  readonly hostnames = ['kimi.com'];
+  readonly hostnames = ['kimi.com', 'kimi.ai'];
   readonly capabilities: AdapterCapability[] = [
     'text-insertion',
     'form-submission',
@@ -31,7 +32,9 @@ export class KimiAdapter extends BaseAdapterPlugin {
     // Primary chat input selector - Kimi uses contenteditable div
     CHAT_INPUT: '.chat-input-editor[contenteditable="true"], div[contenteditable="true"][data-lexical-editor="true"], .chat-input-editor, .chat-input, textarea[placeholder*="Ask"]',
     // Submit button selectors (multiple fallbacks)
-    SUBMIT_BUTTON: '.send-button, .send-icon, svg.send-icon, button[aria-label*="Send"], .send-button-container:not(.disabled) .send-button',
+    // Live DOM (kimi.com): the clickable is div.send-button-container (has .disabled when empty);
+    // the old `.send-button` class no longer exists (0 matches = selector rot).
+    SUBMIT_BUTTON: '.send-button-container:not(.disabled), .send-button-container, .send-button, .send-icon, svg.send-icon, button[aria-label*="Send"]',
     // File upload related selectors
     FILE_UPLOAD_BUTTON: '.attachment-button, .attachment-icon, input[type="file"], label.attachment-button',
     FILE_INPUT: 'input[type="file"]',
@@ -124,6 +127,7 @@ export class KimiAdapter extends BaseAdapterPlugin {
     // Clean up UI integration
     this.cleanupUIIntegration();
     this.cleanupDOMObservers();
+    inputChips.teardown();
 
     // Reset setup flags
     this.storeEventListenersSetup = false;
@@ -156,7 +160,8 @@ export class KimiAdapter extends BaseAdapterPlugin {
     // Final cleanup
     this.cleanupUIIntegration();
     this.cleanupDOMObservers();
-    
+    inputChips.teardown();
+
     // Reset all setup flags
     this.storeEventListenersSetup = false;
     this.domObserversSetup = false;
@@ -167,7 +172,12 @@ export class KimiAdapter extends BaseAdapterPlugin {
    * Insert text into the Kimi chat input field
    * Enhanced with better selector handling and event integration
    */
-  async insertText(text: string, options?: { targetElement?: HTMLElement }): Promise<boolean> {
+  async insertText(text: string, options?: { targetElement?: HTMLElement; source?: 'instructions' | 'tool-result' | 'capture' | 'tab-content' | 'unknown'; label?: string }): Promise<boolean> {
+    if (inputChips.tryCapture(this, text, options)) {
+      this.emitExecutionCompleted('insertText', { text }, { success: true, method: 'chip-capture' });
+      return true;
+    }
+
     this.context.logger.debug(`Attempting to insert text into Kimi chat input: ${text.substring(0, 50)}${text.length > 50 ? '...' : ''}`);
 
     let targetElement: HTMLElement | null = null;
@@ -221,9 +231,21 @@ export class KimiAdapter extends BaseAdapterPlugin {
         targetElement.focus();
         
         let insertionSuccess = false;
-        
-        // Method 1: Try clipboard simulation first (often works best with Lexical)
-        try {
+
+        // Method 0: a synthetic paste needs no clipboard permission (navigator.clipboard read/write can be
+        // refused or stall without focus, which left chip flushes hanging). Kimi handles it natively —
+        // long text becomes an uploaded TXT attachment. Count it as done if the editor reacted.
+        const snapshot = () => `${targetElement!.textContent?.length}|${document.querySelectorAll('.file-card-container').length}`;
+        const beforePaste = snapshot();
+        const pasteData = new DataTransfer();
+        pasteData.setData('text/plain', text);
+        const syntheticPaste = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: pasteData });
+        targetElement.dispatchEvent(syntheticPaste);
+        await new Promise(r => setTimeout(r, 150));
+        if (syntheticPaste.defaultPrevented || snapshot() !== beforePaste) insertionSuccess = true;
+
+        // Method 1: Try clipboard simulation (often works best with Lexical)
+        if (!insertionSuccess) try {
           // Firefox has stricter clipboard security, check for proper permissions
           const isFirefox = navigator.userAgent.toLowerCase().includes('firefox');
           
@@ -512,7 +534,37 @@ export class KimiAdapter extends BaseAdapterPlugin {
    * Submit the current text in the Kimi chat input
    * Enhanced with multiple selector fallbacks and better error handling
    */
+  getChipAnchors(): ChipAnchors | null {
+    let input: HTMLElement | null = null;
+    for (const sel of this.selectors.CHAT_INPUT.split(', ')) {
+      input = document.querySelector(sel.trim()) as HTMLElement | null;
+      if (input) break;
+    }
+    if (!input) return null;
+    // Live DOM (kimi.com): .chat-editor-content wraps both the input (.chat-input) and the
+    // button row (.chat-editor-action), overflow: visible — prepending the chip bar there puts
+    // it above the input. Fall back up the composer chain, then to parentElement.
+    const container = (input.closest('.chat-editor-content')
+      ?? input.closest('.chat-editor')
+      ?? input.closest('.chat-box')
+      ?? input.parentElement) as HTMLElement | null;
+    if (!container) return null;
+    return { input, container, submitButtonSelector: this.selectors.SUBMIT_BUTTON };
+  }
+
   async submitForm(options?: { formElement?: HTMLFormElement }): Promise<boolean> {
+    await inputChips.flushBeforeSubmit(this);
+
+    // Kimi turns a long paste (the flushed chip payload) into an uploading TXT attachment and keeps
+    // the send button .disabled until the upload finishes (~1s), so a click right away is dropped.
+    // ponytail: 15s cap; past that the click below is attempted anyway.
+    for (let waited = 0; waited < 15000; waited += 250) {
+      const uploading = document.querySelector('.file-card-container.uploading');
+      const sendDisabled = document.querySelector('.send-button-container.disabled');
+      if (!uploading && !sendDisabled) break;
+      await new Promise(r => setTimeout(r, 250));
+    }
+
     this.context.logger.debug('Attempting to submit Kimi chat input');
 
     let submitButton: HTMLButtonElement | null = null;
@@ -783,8 +835,8 @@ export class KimiAdapter extends BaseAdapterPlugin {
 
     // Check if we're on a supported Kimi page
     const supportedPatterns = [
-      /^https?:\/\/(?:www\.)?kimi\.com\/.*/,  // Main chat pages
-      /^https?:\/\/(?:www\.)?kimi\.com$/      // Base chat page
+      /^https?:\/\/(?:www\.)?kimi\.(?:com|ai)\/.*/,  // Main chat pages
+      /^https?:\/\/(?:www\.)?kimi\.(?:com|ai)$/      // Base chat page
     ];
 
     const isSupported = supportedPatterns.some(pattern => pattern.test(currentUrl));
@@ -1048,6 +1100,15 @@ export class KimiAdapter extends BaseAdapterPlugin {
 
   private findButtonInsertionPoint(): { container: Element; insertAfter: Element | null } | null {
     this.context.logger.debug('Finding button insertion point for MCP popover');
+
+    // Current Kimi UI: the "+" (toolkit) button lives in .left-area; place the MCP button right after it.
+    const toolkitBtn = document.querySelector('.chat-editor-action .left-area .toolkit-trigger-btn');
+    const leftArea = toolkitBtn?.closest('.left-area');
+    if (toolkitBtn && leftArea) {
+      let anchor: Element = toolkitBtn;
+      while (anchor.parentElement && anchor.parentElement !== leftArea) anchor = anchor.parentElement;
+      return { container: leftArea, insertAfter: anchor };
+    }
 
     // Try Kimi-specific button container first (.right-area)
     const buttonContainer = document.querySelector('.chat-editor-action .right-area');

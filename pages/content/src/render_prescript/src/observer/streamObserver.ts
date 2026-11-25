@@ -17,6 +17,7 @@ declare global {
 import { CONFIG } from '../core/config';
 import { renderFunctionCall } from '../renderer/index';
 import { extractParameters, containsFunctionCalls, extractLanguageTag } from '../parser/index';
+import { scheduleWork } from '../utils/index';
 import { extractJSONParameters } from '../parser/jsonFunctionParser';
 
 // Maps to store observers and state for streaming content
@@ -86,53 +87,17 @@ const isCompletionStable = (blockId: string): boolean => {
 
 // Performance cache for pattern matching
 const PATTERN_CACHE = {
-  functionCallsStart: /<function_calls>/g,
-  functionCallsEnd: /<\/function_calls>/g,
-  invokeStart: /<invoke[^>]*>/g,
-  invokeEnd: /<\/invoke>/g,
-  parameterStart: /<parameter[^>]*>/g,
-  parameterEnd: /<\/parameter>/g,
   allFunctionPatterns: /(<function_calls>|<\/function_calls>|<invoke[^>]*>|<\/invoke>|<parameter[^>]*>|<\/parameter>)/g,
 };
 
-// Fast content analysis cache to avoid repeated parsing
-const contentAnalysisCache = new Map<
-  string,
-  {
-    hasFunction: boolean;
-    isComplete: boolean;
-    timestamp: number;
-  }
->();
-
 // Debounced rendering to prevent rapid-fire updates
-const renderingDebouncer = new Map<string, number>();
+const renderingDebouncer = new Map<string, ReturnType<typeof setTimeout>>();
 const RENDER_DEBOUNCE_MS = 50; // 50ms debounce for smooth rendering
 
 // Make resyncingBlocks globally accessible to prevent re-rendering during resync
 if (typeof window !== 'undefined') {
   (window as any).resyncingBlocks = resyncingBlocks;
 }
-
-// Fast chunk detection system for immediate response
-const CHUNK_PATTERNS = {
-  functionStart: /<function_calls>/,
-  invokeStart: /<invoke\s+name="[^"]*"/,
-  parameterStart: /<parameter\s+name="[^"]*">/,
-  anyClosingTag: /<\/(?:function_calls|invoke|parameter)>/,
-  // Pre-compiled for faster detection
-  functionChunkStart: /(<function_calls>|<invoke\s+name="[^"]*"|<parameter\s+name="[^"]*">)/,
-  significantChunk: /(<function_calls>|<invoke|<parameter|<\/)/,
-  // JSON patterns - enhanced for Unicode support
-  jsonFunctionStart: /"type"\s*:\s*"function_call_start"/,
-  jsonParameter: /"type"\s*:\s*"parameter"/,
-  jsonDescription: /"type"\s*:\s*"description"/,
-  jsonFunctionEnd: /"type"\s*:\s*"function_call_end"/,
-  jsonSignificant: /"type"\s*:\s*"(?:function_call_start|parameter|description|function_call_end)"/,
-  // Enhanced patterns for partial/incomplete JSON during streaming
-  jsonPartialFunctionCall: /"type"\s*:\s*"function_call_/,
-  jsonPartialParameter: /"type"\s*:\s*"parameter"/,
-};
 
 // Track parameter content during streaming to prevent loss
 const parameterContentCache = new Map<string, Map<string, string>>(); // blockId -> paramName -> content
@@ -190,226 +155,6 @@ const getCachedParameterContent = (blockId: string): Map<string, string> => {
 };
 
 /**
- * Ultra-fast chunk detection for immediate streaming response
- * Enhanced to handle Unicode characters and partial JSON during streaming
- */
-const detectFunctionChunk = (
-  content: string,
-  previousContent: string = '',
-): {
-  hasNewChunk: boolean;
-  chunkType: 'function_start' | 'invoke' | 'parameter' | 'closing' | 'content' | null;
-  isSignificant: boolean;
-} => {
-  // Get only the new content since last check
-  const newContent = content.slice(previousContent.length);
-
-  if (newContent.length === 0) {
-    return { hasNewChunk: false, chunkType: null, isSignificant: false };
-  }
-
-  // Check for JSON patterns first - handle partial matches during streaming
-  if (CHUNK_PATTERNS.jsonFunctionStart.test(newContent)) {
-    return { hasNewChunk: true, chunkType: 'function_start', isSignificant: true };
-  }
-
-  if (CHUNK_PATTERNS.jsonParameter.test(newContent)) {
-    return { hasNewChunk: true, chunkType: 'parameter', isSignificant: true };
-  }
-
-  if (CHUNK_PATTERNS.jsonDescription.test(newContent)) {
-    return { hasNewChunk: true, chunkType: 'content', isSignificant: true };
-  }
-
-  if (CHUNK_PATTERNS.jsonFunctionEnd.test(newContent)) {
-    return { hasNewChunk: true, chunkType: 'closing', isSignificant: true };
-  }
-
-  // Enhanced: Check for partial/incomplete JSON function calls during streaming
-  // This catches cases where "function_call" is being typed character by character
-  if (CHUNK_PATTERNS.jsonPartialFunctionCall.test(newContent)) {
-    return { hasNewChunk: true, chunkType: 'content', isSignificant: newContent.length > 30 };
-  }
-
-  // Check for XML patterns
-  if (CHUNK_PATTERNS.functionStart.test(newContent)) {
-    return { hasNewChunk: true, chunkType: 'function_start', isSignificant: true };
-  }
-
-  if (CHUNK_PATTERNS.invokeStart.test(newContent)) {
-    return { hasNewChunk: true, chunkType: 'invoke', isSignificant: true };
-  }
-
-  if (CHUNK_PATTERNS.parameterStart.test(newContent)) {
-    return { hasNewChunk: true, chunkType: 'parameter', isSignificant: true };
-  }
-
-  if (CHUNK_PATTERNS.anyClosingTag.test(newContent)) {
-    return { hasNewChunk: true, chunkType: 'closing', isSignificant: true };
-  }
-
-  // Check if it's any significant content (XML or JSON)
-  // Enhanced to handle Unicode content length detection
-  const contentLength = [...newContent].length; // Count Unicode characters correctly
-  if (
-    CHUNK_PATTERNS.significantChunk.test(newContent) ||
-    CHUNK_PATTERNS.jsonSignificant.test(newContent) ||
-    contentLength > 20
-  ) {
-    return { hasNewChunk: true, chunkType: 'content', isSignificant: contentLength > 20 };
-  }
-
-  return { hasNewChunk: false, chunkType: null, isSignificant: false };
-};
-
-// Track previous content for chunk detection
-const previousContentCache = new Map<string, string>();
-
-/**
- * Immediate chunk processor for instant response
- */
-const processChunkImmediate = (
-  blockId: string,
-  newContent: string,
-  chunkInfo: ReturnType<typeof detectFunctionChunk>,
-): void => {
-  if (!chunkInfo.hasNewChunk || !chunkInfo.isSignificant) return;
-
-  // Find target element immediately
-  const target = document.querySelector(`div[data-block-id="${blockId}"]`) as HTMLElement;
-  if (!target) return;
-
-  // Skip if already processing or complete
-  if (completedStreams.has(blockId) || resyncingBlocks.has(blockId)) return;
-
-  if (CONFIG.debug) {
-    logger.debug(
-      `Immediate chunk detected for ${blockId}: ${chunkInfo.chunkType}, content length: ${newContent.length}`,
-    );
-  }
-
-  // For parameter content, use longer delays to allow content to accumulate
-  let delay = 25; // Default delay
-
-  if (chunkInfo.chunkType === 'function_start') {
-    delay = 10; // Very fast for function starts
-  } else if (chunkInfo.chunkType === 'parameter') {
-    delay = 100; // Longer delay for parameters to accumulate content
-  } else if (chunkInfo.chunkType === 'content') {
-    delay = 150; // Even longer for parameter content
-  }
-
-  // Use immediate scheduling with appropriate delay for chunk type
-  const timer = setTimeout(() => {
-    if (!completedStreams.has(blockId) && !resyncingBlocks.has(blockId)) {
-      const targetQueue = window._updateQueue || updateQueue;
-      targetQueue.set(blockId, target);
-
-      if (typeof window !== 'undefined' && window._processUpdateQueue) {
-        window._processUpdateQueue();
-      }
-    }
-  }, delay);
-
-  // Clear any existing timer and set new one
-  const existingTimer = renderingDebouncer.get(blockId);
-  if (existingTimer) clearTimeout(existingTimer);
-  renderingDebouncer.set(blockId, timer);
-};
-
-/**
- * Fast content analysis using pre-compiled patterns and caching
- */
-const analyzeFunctionContent = (
-  content: string,
-  useCache: boolean = true,
-): {
-  hasFunction: boolean;
-  isComplete: boolean;
-  functionCallPattern: boolean;
-} => {
-  if (useCache) {
-    const cached = contentAnalysisCache.get(content);
-    if (cached && Date.now() - cached.timestamp < 1000) {
-      // Cache for 1 second
-      return {
-        hasFunction: cached.hasFunction,
-        isComplete: cached.isComplete,
-        functionCallPattern: cached.hasFunction,
-      };
-    }
-  }
-
-  // Check for JSON format first
-  const hasJSONStart = CHUNK_PATTERNS.jsonFunctionStart.test(content);
-  const hasJSONEnd = CHUNK_PATTERNS.jsonFunctionEnd.test(content);
-  const hasJSONParam = CHUNK_PATTERNS.jsonParameter.test(content);
-
-  if (hasJSONStart || hasJSONParam) {
-    const result = {
-      hasFunction: true,
-      isComplete: hasJSONStart && hasJSONEnd,
-      functionCallPattern: true,
-    };
-
-    if (useCache) {
-      contentAnalysisCache.set(content, { ...result, timestamp: Date.now() });
-    }
-
-    return result;
-  }
-
-  // Reset regex states for accurate matching (XML)
-  PATTERN_CACHE.functionCallsStart.lastIndex = 0;
-  PATTERN_CACHE.functionCallsEnd.lastIndex = 0;
-  PATTERN_CACHE.invokeStart.lastIndex = 0;
-  PATTERN_CACHE.invokeEnd.lastIndex = 0;
-  PATTERN_CACHE.parameterStart.lastIndex = 0;
-  PATTERN_CACHE.parameterEnd.lastIndex = 0;
-
-  // Fast pattern detection using pre-compiled regex
-  const hasFunctionCalls = PATTERN_CACHE.functionCallsStart.test(content);
-  const hasInvoke = PATTERN_CACHE.invokeStart.test(content);
-  const hasParameter = PATTERN_CACHE.parameterStart.test(content);
-
-  const hasFunction = hasFunctionCalls || hasInvoke || hasParameter;
-
-  if (!hasFunction) {
-    const result = { hasFunction: false, isComplete: false, functionCallPattern: false };
-    if (useCache) {
-      contentAnalysisCache.set(content, { ...result, timestamp: Date.now() });
-    }
-    return result;
-  }
-
-  // Check completion using efficient counting
-  PATTERN_CACHE.functionCallsStart.lastIndex = 0;
-  PATTERN_CACHE.functionCallsEnd.lastIndex = 0;
-  PATTERN_CACHE.invokeStart.lastIndex = 0;
-  PATTERN_CACHE.invokeEnd.lastIndex = 0;
-  PATTERN_CACHE.parameterStart.lastIndex = 0;
-  PATTERN_CACHE.parameterEnd.lastIndex = 0;
-
-  const functionCallsOpen = (content.match(PATTERN_CACHE.functionCallsStart) || []).length;
-  const functionCallsClosed = (content.match(PATTERN_CACHE.functionCallsEnd) || []).length;
-  const invokeOpen = (content.match(PATTERN_CACHE.invokeStart) || []).length;
-  const invokeClosed = (content.match(PATTERN_CACHE.invokeEnd) || []).length;
-  const parameterOpen = (content.match(PATTERN_CACHE.parameterStart) || []).length;
-  const parameterClosed = (content.match(PATTERN_CACHE.parameterEnd) || []).length;
-
-  const isComplete =
-    functionCallsOpen <= functionCallsClosed && invokeOpen <= invokeClosed && parameterOpen <= parameterClosed;
-
-  const result = { hasFunction, isComplete, functionCallPattern: hasFunction };
-
-  if (useCache) {
-    contentAnalysisCache.set(content, { ...result, timestamp: Date.now() });
-  }
-
-  return result;
-};
-
-/**
  * Optimized debounced rendering to prevent excessive updates
  */
 const scheduleOptimizedRender = (blockId: string, target: HTMLElement): void => {
@@ -425,6 +170,9 @@ const scheduleOptimizedRender = (blockId: string, target: HTMLElement): void => 
 
     // Only render if not completed or resyncing
     if (!completedStreams.has(blockId) && !resyncingBlocks.has(blockId)) {
+      // Cache latest parameter content once per debounce window (consumed by resyncWithOriginalContent)
+      cacheParameterContent(blockId, target.textContent || '');
+
       // Update the queue for rendering
       const targetQueue = window._updateQueue || updateQueue;
       targetQueue.set(blockId, target);
@@ -471,6 +219,12 @@ export const monitorNode = (node: HTMLElement, blockId: string): void => {
 
   // Setup a periodic checker for this node that can detect abrupt endings
   const periodicChecker = setInterval(() => {
+    // Stop checking completed blocks so intervals don't accumulate in long chats
+    if (completedStreams.has(blockId)) {
+      clearInterval(periodicChecker);
+      return;
+    }
+
     // If node is no longer in the DOM, clean up
     if (!document.body.contains(node)) {
       clearInterval(periodicChecker);
@@ -487,12 +241,11 @@ export const monitorNode = (node: HTMLElement, blockId: string): void => {
     const hasOpenParameterTags =
       (currentContent.match(/<parameter[^>]*>/g) || []).length > (currentContent.match(/<\/parameter>/g) || []).length;
 
-    // Check for incomplete JSON
-    const hasJSONStart = currentContent.includes('"type"') && currentContent.includes('function_call_start');
-    const hasJSONEnd =
-      currentContent.includes('"type"') &&
-      (currentContent.includes('"function_call_end"') || currentContent.includes('"type": "function_call_end"'));
-    const hasIncompleteJSON = hasJSONStart && !hasJSONEnd;
+    // Check for incomplete JSON — count starts vs ends so a stalled SECOND call is
+    // still detected once the first call's function_call_end already exists.
+    const jsonStarts = (currentContent.match(/function_call_start/g) || []).length;
+    const jsonEnds = (currentContent.match(/function_call_end/g) || []).length;
+    const hasIncompleteJSON = jsonStarts > jsonEnds;
 
     // Detect incomplete tags (XML or JSON)
     if (hasOpenFunctionCallsTag || hasOpenInvokeTag || hasOpenParameterTags || hasIncompleteJSON) {
@@ -572,31 +325,8 @@ export const monitorNode = (node: HTMLElement, blockId: string): void => {
 
         // Check for significant size changes in content
         if (mutation.type === 'characterData') {
-          const oldValue = mutation.oldValue || '';
           const newValue = textContent;
-
-          // Get previous content for chunk detection
-          const previousContent = previousContentCache.get(blockId) || '';
-
-          // Use immediate chunk detection for instant response
-          const chunkInfo = detectFunctionChunk(newValue, previousContent);
-
-          if (CONFIG.debug && chunkInfo.hasNewChunk) {
-            logger.debug(`Chunk detected - type: ${chunkInfo.chunkType}, significant: ${chunkInfo.isSignificant}`);
-          }
-
-          if (chunkInfo.hasNewChunk && chunkInfo.isSignificant) {
-            significantChange = true;
-            // Cache parameter content during streaming
-            cacheParameterContent(blockId, newValue);
-            // Process chunk immediately for instant response
-            processChunkImmediate(blockId, newValue, chunkInfo);
-          } else if (Math.abs(newValue.length - oldValue.length) > 10) {
-            significantChange = true;
-          }
-
-          // Update previous content cache
-          previousContentCache.set(blockId, newValue);
+          significantChange = newValue.length !== (mutation.oldValue || '').length;
         }
 
         if (mutation.type === 'childList' && (mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0)) {
@@ -620,7 +350,7 @@ export const monitorNode = (node: HTMLElement, blockId: string): void => {
 
       // Find the nearest element that contains our monitored node
       let target = node;
-      while (target && !CONFIG.targetSelectors.includes(target.tagName.toLowerCase())) {
+      while (target && !CONFIG.targetSelectors.some(selector => target.matches(selector))) {
         target = target.parentElement as HTMLElement;
         if (!target) break;
       }
@@ -719,9 +449,9 @@ const performSeamlessCompletion = (blockId: string, finalContent: string): void 
   // Mark as transitioning to prevent duplicate completion attempts
   functionBlock.setAttribute('data-completing', 'true');
 
-  // Use multiple requestAnimationFrame calls for ultra-smooth transition
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
+  // Schedule the completion transition (must run even when the tab is hidden)
+  scheduleWork(() => {
+    scheduleWork(() => {
       // Remove loading state and add complete state
       functionBlock.classList.remove('function-loading');
       functionBlock.classList.add('function-complete');
@@ -816,8 +546,8 @@ export const resyncWithOriginalContent = (blockId: string): void => {
   const isAlreadyComplete = functionBlock.classList.contains('function-complete');
   const isCurrentlyLoading = functionBlock.classList.contains('function-loading');
 
-  // Use a single requestAnimationFrame to batch all updates
-  requestAnimationFrame(() => {
+  // Batch all updates; schedule so it still runs when the tab is hidden
+  scheduleWork(() => {
     // Only update function name if it's actually different and won't cause jitter
     if (originalFunctionName && !isAlreadyComplete) {
       const functionNameElement = functionBlock.querySelector('.function-name-text');

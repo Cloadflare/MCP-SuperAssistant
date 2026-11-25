@@ -4,19 +4,46 @@ import { safelySetContent } from '../utils/index';
 import {
   addRawXmlToggle,
   addExecuteButton,
-  setupAutoScroll,
-  smoothlyUpdateBlockContent,
   extractFunctionParameters,
 } from './components';
 import { applyThemeClass } from '../utils/themeDetector';
 import { getPreviousExecution, getPreviousExecutionLegacy, generateContentSignature } from '../mcpexecute/storage';
-import type { ParamValueElement } from '../core/types';
-import { extractJSONFunctionInfo, extractJSONParameters } from '../parser/jsonFunctionParser';
+import {
+  extractJSONFunctionInfo,
+  extractJSONParameters,
+  splitJSONFunctionSegments,
+  analyzeJSONSegment,
+} from '../parser/jsonFunctionParser';
 import { createLogger } from '@extension/shared/lib/logger';
+import { telemetry } from '../../../utils/telemetry';
 
 // Define custom property for tracking scroll state
 
 const logger = createLogger('FunctionBlockRenderer');
+
+// Calls quoted in the user's own message (e.g. the examples inside injected instructions) must never
+// auto-run; only assistant output may. One selector per site's user-turn container.
+const USER_MESSAGE_SELECTOR = [
+  '[data-message-author-role="user"]', // ChatGPT (legacy) and others
+  '[data-content-search-unit-key$=":user"]', // ChatGPT (Nov 2026)
+  '[data-testid="user-message"]', // Claude, OpenRouter
+  '[data-message-bubble="right"]', // Perplexity
+  'user-query', // Gemini
+  '[data-turn-role="User"]', // AI Studio
+  '[class*="UserMessage__"]', // GitHub Copilot
+  '[class*="group/user"]', // Grok on X
+  'div._9663006', // DeepSeek (hashed class; no stable attribute exists)
+].join(', ');
+const isInUserMessage = (el: Element): boolean => !!el.closest(USER_MESSAGE_SELECTOR);
+
+// Grok on X renders each code line as <span class="block"> with no newline characters, so textContent
+// glues the JSONL lines together and line-based name/call-id parsing fails. Rebuild the line breaks.
+const getBlockText = (block: HTMLElement): string => {
+  const text = block.textContent || '';
+  if (text.includes('\n')) return text.trim();
+  const lines = block.querySelectorAll('code > span.block');
+  return (lines.length > 1 ? Array.from(lines, l => l.textContent).join('\n') : text).trim();
+};
 
 declare global {
   interface HTMLElement {
@@ -24,6 +51,7 @@ declare global {
     _scrollInitialized?: boolean;
     _scrollCleanup?: () => void;
     _scrollHandlersInitialized?: boolean;
+    _mcpSource?: HTMLElement; // card -> the element it renders (orphan check in mutationObserver)
     value?: string; // For compatibility with input elements
   }
 }
@@ -32,7 +60,32 @@ declare global {
 const STREAMING_DEBOUNCE_MS = 16; // ~60fps for smooth updates
 const MAX_AUTO_EXECUTE_ATTEMPTS = 3;
 const CACHE_TTL = 1000; // 1 second cache TTL
-const STREAMING_TIMEOUT = 1500;
+
+// Sequential auto-execution queue. Multiple complete cards (one message with N
+// calls) would otherwise click Run in the same tick and race the insert/submit
+// path. Chaining serializes them; __mcpExecPending lets the automation service
+// hold its coalesced submit until the whole queue drains.
+// ponytail: enqueue order = card completion order = call_id order within a block; DOM order across blocks.
+let execChain: Promise<void> = Promise.resolve();
+if (typeof window !== 'undefined') (window as any).__mcpExecPending = 0;
+
+// Resolve once a card finishes executing (success or error class set by
+// components.ts), or after a hard timeout so one stuck call can't wedge the queue.
+// ponytail: 250ms class poll, MutationObserver if it ever matters
+const waitForSettled = (blockEl: HTMLElement): Promise<void> =>
+  new Promise(resolve => {
+    const start = Date.now();
+    const poll = window.setInterval(() => {
+      if (
+        blockEl.classList.contains('exec-success') ||
+        blockEl.classList.contains('exec-error') ||
+        Date.now() - start > 35000 // mcp-client tool timeout is 30s; resolve anyway past that
+      ) {
+        clearInterval(poll);
+        resolve();
+      }
+    }, 250);
+  });
 
 // Performance optimizations: Pre-compiled regex patterns
 const REGEX_CACHE = {
@@ -477,15 +530,6 @@ const injectStreamingStyles = (() => {
         transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
       }
       
-      .param-value[data-streaming="true"] .content-wrapper {
-        animation: subtle-breathe 3s ease-in-out infinite;
-      }
-      
-      @keyframes subtle-breathe {
-        0%, 100% { transform: scale(1); }
-        50% { transform: scale(1.001); }
-      }
-      
       /* Enhanced scrolling styles */
       .param-value[data-streaming="true"] {
         overflow-y: auto !important;
@@ -666,22 +710,35 @@ const AutoExpandUtils = {
       });
       
       const targetHeight = expandableContent.scrollHeight + 24;
-      
+
       requestAnimationFrame(() => {
         DOMUtils.applyStyles(expandableContent, {
           maxHeight: targetHeight + 'px',
           opacity: '1',
           paddingTop: '12px',
           paddingBottom: '12px',
-          transition: 'all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94)',
+          transition:
+            'max-height 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94), opacity 0.4s ease, padding 0.4s ease',
         });
-        
+
         const expandIcon = expandButton.querySelector('svg path');
         if (expandIcon) {
           expandIcon.setAttribute('d', 'M16 14l-4-4-4 4');
         }
         expandButton.title = 'Collapse function details';
       });
+
+      // Release the height clamp after the animation so content that streams in
+      // afterwards is not clipped at the height measured at expand time.
+      PerformanceUtils.setManagedTimeout(
+        'expand-' + blockDiv.getAttribute('data-block-id'),
+        () => {
+          if (blockDiv.classList.contains('expanded')) {
+            expandableContent.style.maxHeight = 'none';
+          }
+        },
+        450,
+      );
     } else {
       // Instant expansion
       DOMUtils.applyStyles(expandableContent, {
@@ -716,9 +773,10 @@ const AutoExpandUtils = {
           opacity: '0',
           paddingTop: '0',
           paddingBottom: '0',
-          transition: 'all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94)',
+          transition:
+            'max-height 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94), opacity 0.4s ease, padding 0.4s ease',
         });
-        
+
         const expandIcon = expandButton.querySelector('svg path');
         if (expandIcon) {
           expandIcon.setAttribute('d', 'M8 10l4 4 4-4');
@@ -826,7 +884,7 @@ const BlockElementUtils = {
     DOMUtils.applyStyles(expandableContent, {
       display: 'none',
       overflow: 'hidden',
-      transition: 'all 0.25s cubic-bezier(0.4, 0, 0.2, 1)',
+      transition: 'max-height .25s cubic-bezier(0.4,0,0.2,1), opacity .25s ease, padding .25s ease',
       maxHeight: '0px',
       opacity: '0',
     });
@@ -903,19 +961,34 @@ const BlockElementUtils = {
           }
           expandButton.title = 'Collapse function details';
         });
+
+        // Release the height clamp after the animation so later content isn't clipped.
+        PerformanceUtils.setManagedTimeout(
+          'expand-' + blockDiv.getAttribute('data-block-id'),
+          () => {
+            if (blockDiv.classList.contains('expanded')) {
+              expandableContent.style.maxHeight = 'none';
+            }
+          },
+          450,
+        );
       }
     };
 
-    // Attach click handler to expand button
-    expandButton.onclick = toggleExpandCollapse;
+    // Attach click handlers once; renderFunctionCall calls this every pass.
+    if (!(expandButton as any)._wired) {
+      expandButton.onclick = toggleExpandCollapse;
 
-    // Make entire function-name area clickable
-    const functionNameElement = blockDiv.querySelector('.function-name') as HTMLDivElement;
-    if (functionNameElement) {
-      DOMUtils.applyStyles(functionNameElement, {
-        cursor: 'pointer',
-      });
-      functionNameElement.onclick = toggleExpandCollapse;
+      // Make entire function-name area clickable
+      const functionNameElement = blockDiv.querySelector('.function-name') as HTMLDivElement;
+      if (functionNameElement) {
+        DOMUtils.applyStyles(functionNameElement, {
+          cursor: 'pointer',
+        });
+        functionNameElement.onclick = toggleExpandCollapse;
+      }
+
+      (expandButton as any)._wired = true;
     }
   },
 };
@@ -956,17 +1029,20 @@ const ParamElementUtils = {
   },
 
   updateContent: (preElement: HTMLPreElement, displayValue: string, isStreaming: boolean): void => {
-    const currentText = preElement.textContent || '';
-    if (currentText !== displayValue) {
-      if (isStreaming && displayValue.length > currentText.length + 50) {
-        preElement.style.opacity = '0.85';
-        setTimeout(() => {
-          preElement.textContent = displayValue;
-          preElement.style.opacity = '1';
-        }, 8);
-      } else {
-        preElement.textContent = displayValue;
-      }
+    const current = preElement.textContent || '';
+    if (current === displayValue) return;
+    // Append only the new tail when content grows monotonically (the common streaming case)
+    // to avoid replacing the whole text node (and the opacity flash it used to cause).
+    const first = preElement.firstChild;
+    if (
+      displayValue.startsWith(current) &&
+      current.length > 0 &&
+      first?.nodeType === Node.TEXT_NODE &&
+      !first.nextSibling
+    ) {
+      (first as Text).appendData(displayValue.slice(current.length));
+    } else {
+      preElement.textContent = displayValue;
     }
   },
 
@@ -996,26 +1072,9 @@ const ParamElementUtils = {
         ScrollUtils.setupScrollTracking(paramValueElement);
       }
 
-      setupAutoScroll(paramValueElement as ParamValueElement);
       ScrollUtils.performStreamingScroll(paramValueElement);
-
-      PerformanceUtils.setManagedTimeout(
-        timeoutKey,
-        () => {
-          if (paramNameElement && document.body.contains(paramNameElement)) {
-            paramNameElement.classList.remove('streaming-param-name');
-            if (paramValueElement) {
-              paramValueElement.removeAttribute('data-streaming');
-              paramValueElement.removeAttribute('data-streaming-styled');
-              DOMUtils.applyStyles(paramValueElement, {
-                willChange: 'auto',
-                containIntrinsicSize: 'auto',
-              });
-            }
-          }
-        },
-        STREAMING_TIMEOUT,
-      );
+      // Streaming state is cleared only when the parser reports the param complete
+      // (the else branch below) — no timeout-based teardown that caused collapse/re-expand churn.
     } else {
       if (paramNameElement.classList.contains('streaming-param-name')) {
         setTimeout(() => {
@@ -1026,16 +1085,6 @@ const ParamElementUtils = {
             willChange: 'auto',
             containIntrinsicSize: 'auto',
           });
-          
-          // Check if block should auto-collapse when streaming ends
-          const blockDiv = paramValueElement.closest('.function-block') as HTMLDivElement;
-          if (blockDiv && blockDiv.classList.contains('auto-expanded')) {
-            // Check if any other parameters are still streaming
-            const stillStreaming = blockDiv.querySelector('[data-streaming="true"]');
-            if (!stillStreaming) {
-              AutoExpandUtils.scheduleAutoCollapse(blockDiv, 1200);
-            }
-          }
         }, 100);
       }
 
@@ -1119,8 +1168,22 @@ const AutoExecutionUtils = {
 
           const executeButton = currentBlock.querySelector<HTMLButtonElement>('.execute-button');
           if (executeButton) {
-            logger.debug(`Auto-execute: Executing function ${functionDetails.functionName}`);
-            executeButton.click();
+            logger.debug(`Auto-execute: Enqueuing function ${functionDetails.functionName}`);
+            const blockToSettle = currentBlock;
+            (window as any).__mcpExecPending = ((window as any).__mcpExecPending || 0) + 1;
+            execChain = execChain
+              .then(async () => {
+                try {
+                  telemetry('auto_execute');
+                  blockToSettle.querySelector<HTMLButtonElement>('.execute-button')?.click();
+                  await waitForSettled(blockToSettle);
+                } catch (e) {
+                  logger.error('Auto-execute chain error:', e);
+                }
+              })
+              .finally(() => {
+                (window as any).__mcpExecPending = Math.max(0, ((window as any).__mcpExecPending || 1) - 1);
+              });
             executionTracker.cleanupBlock(blockId);
           } else {
             logger.debug(`Auto-execute: Execute button not found (attempt ${attempts}/${MAX_AUTO_EXECUTE_ATTEMPTS})`);
@@ -1142,13 +1205,14 @@ const AutoExecutionUtils = {
   findReplacementBlock: (functionDetails: any): HTMLDivElement | null => {
     const potentialBlocks = document.querySelectorAll<HTMLDivElement>('.function-block');
     for (const block of potentialBlocks) {
-      const preElement = block.querySelector('pre');
-      if (!preElement?.textContent) continue;
+      // Match on the rendered (format-normalised) name + call-id instead of re-parsing the raw
+      // body with an XML-only <invoke> regex. That regex never matched JSON/JSONL (compact-mode)
+      // blocks, so when the page re-rendered a compact block during the auto-execute delay the
+      // recovery lookup always failed and auto-execute silently never fired.
+      const name = block.querySelector('.function-name-text')?.textContent?.trim();
+      const callId = block.querySelector('.call-id')?.textContent?.trim();
 
-      const match = REGEX_CACHE.invokeMatch.exec(preElement.textContent);
-      REGEX_CACHE.invokeMatch.lastIndex = 0;
-
-      if (match && match[1] === functionDetails.functionName && match[2] === functionDetails.callId) {
+      if (name === functionDetails.functionName && callId === functionDetails.callId) {
         const alreadyExecuted = getPreviousExecution(
           functionDetails.functionName,
           functionDetails.callId,
@@ -1171,9 +1235,256 @@ if (typeof window !== 'undefined') {
 }
 
 /**
+ * Render ONE function-call card for a jsonl segment. Used only for multi-call
+ * blocks (a message with >1 function-call group). It mirrors the single-card
+ * JSON path of renderFunctionCall but is keyed on a per-card `cardId` and its own
+ * segment string, so each call gets its own name/call_id/params, execute button
+ * and auto-exec. Card 0 reuses the base blockId for rendering/execution continuity.
+ */
+const renderCard = (
+  block: HTMLPreElement,
+  cardId: string,
+  cardContent: string,
+  cardInfo: { functionName: string | null; callId: string | null; description: string | null; isComplete: boolean },
+  isPreExistingIncomplete: boolean,
+): void => {
+  const isComplete = cardInfo.isComplete;
+
+  let existingDiv = renderedFunctionBlocks.get(cardId);
+  if (!existingDiv) {
+    existingDiv = document.querySelector<HTMLDivElement>(`.function-block[data-block-id="${cardId}"]`) || undefined;
+    if (existingDiv) renderedFunctionBlocks.set(cardId, existingDiv);
+  }
+
+  let isNewRender = false;
+  let previousCompletionStatus: boolean | null = null;
+  if (!existingDiv) {
+    isNewRender = true;
+  } else {
+    previousCompletionStatus = existingDiv.classList.contains('function-complete');
+  }
+
+  const rawContent = cardContent;
+  const functionName = cardInfo.functionName || 'function';
+  const callId = cardInfo.callId || `block-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+  const description = cardInfo.description;
+  const partialParameters = extractJSONParameters(rawContent);
+
+  const blockDiv = existingDiv || DOMUtils.createElement<HTMLDivElement>('div');
+
+  if (isNewRender) {
+    blockDiv.className = 'function-block';
+    blockDiv.setAttribute('data-block-id', cardId);
+    applyThemeClass(blockDiv);
+    renderedFunctionBlocks.set(cardId, blockDiv);
+    blockDiv.classList.remove('expanded', 'auto-expanded');
+  }
+
+  if (!isNewRender) {
+    const justCompleted = previousCompletionStatus === false && isComplete;
+    const justBecameIncomplete = previousCompletionStatus === true && !isComplete;
+    if (justCompleted) {
+      blockDiv.classList.remove('function-loading');
+      blockDiv.classList.add('function-complete');
+      const spinner = blockDiv.querySelector('.spinner');
+      if (spinner) spinner.remove();
+    } else if (justBecameIncomplete && !blockDiv.classList.contains('function-complete')) {
+      blockDiv.classList.remove('function-complete');
+      blockDiv.classList.add('function-loading');
+    }
+  } else {
+    if (!isComplete && !isPreExistingIncomplete) {
+      blockDiv.classList.add('function-loading');
+    }
+  }
+
+  const cachedElements = CacheUtils.getCachedElements(blockDiv);
+
+  let functionNameElement = cachedElements.functionNameElement;
+  if (!functionNameElement) {
+    functionNameElement = BlockElementUtils.createFunctionNameSection(
+      functionName,
+      callId,
+      isComplete,
+      isPreExistingIncomplete,
+    );
+    blockDiv.appendChild(functionNameElement);
+    cachedElements.functionNameElement = functionNameElement;
+    elementQueryCache.set(blockDiv, { ...cachedElements, lastCacheTime: Date.now() });
+  } else {
+    const nameText = functionNameElement.querySelector<HTMLSpanElement>('.function-name-text');
+    if (nameText) DOMUtils.updateTextIfChanged(nameText, functionName);
+
+    const callIdElement = functionNameElement.querySelector<HTMLSpanElement>('.call-id');
+    if (callId) {
+      if (callIdElement) {
+        DOMUtils.updateTextIfChanged(callIdElement, callId);
+      } else {
+        const newCallId = DOMUtils.createElement<HTMLSpanElement>('span', 'call-id');
+        newCallId.textContent = callId;
+        functionNameElement.appendChild(newCallId);
+      }
+    }
+  }
+
+  let expandButton = functionNameElement?.querySelector('.expand-button') as HTMLButtonElement | null;
+  let expandableContent = blockDiv.querySelector('.expandable-content') as HTMLDivElement | null;
+
+  if (!expandButton && functionNameElement) {
+    expandButton = BlockElementUtils.createExpandButton();
+    const rightSection = functionNameElement.querySelector('.function-name-right');
+    if (rightSection) {
+      rightSection.appendChild(expandButton);
+    } else {
+      functionNameElement.appendChild(expandButton);
+    }
+  }
+
+  if (!expandableContent) {
+    expandableContent = BlockElementUtils.createExpandableContent();
+    blockDiv.appendChild(expandableContent);
+    if (isNewRender) {
+      DOMUtils.applyStyles(expandableContent, {
+        display: 'none',
+        maxHeight: '0px',
+        opacity: '0',
+        paddingTop: '0',
+        paddingBottom: '0',
+      });
+    }
+  }
+
+  if (expandButton && expandableContent) {
+    BlockElementUtils.setupExpandCollapse(blockDiv, expandButton, expandableContent);
+  }
+
+  if (description && functionNameElement) {
+    const leftSection = functionNameElement.querySelector('.function-name-left') as HTMLDivElement;
+    if (leftSection && !leftSection.querySelector('.function-description')) {
+      DOMUtils.applyStyles(leftSection, {
+        flexDirection: 'column',
+        alignItems: 'flex-start',
+      });
+
+      const descriptionElement = DOMUtils.createElement<HTMLDivElement>('div', 'function-description');
+      descriptionElement.textContent = description;
+      DOMUtils.applyStyles(descriptionElement, {
+        fontSize: '12px',
+        color: 'inherit',
+        marginTop: '4px',
+        fontStyle: 'bold',
+        lineHeight: '1.4',
+        display: 'block',
+        opacity: '0.8',
+      });
+
+      leftSection.appendChild(descriptionElement);
+    }
+  }
+
+  let paramsContainer = cachedElements.paramsContainer;
+  if (!paramsContainer) {
+    paramsContainer = DOMUtils.createElement<HTMLDivElement>('div', 'function-params');
+    DOMUtils.applyStyles(paramsContainer, STREAMING_STYLES.paramsContainer);
+    expandableContent!.appendChild(paramsContainer);
+
+    cachedElements.paramsContainer = paramsContainer;
+    elementQueryCache.set(blockDiv, { ...cachedElements, lastCacheTime: Date.now() });
+  }
+
+  Object.entries(partialParameters).forEach(([paramName, extractedValue]) => {
+    // JSON param streams until this segment's function_call_end arrives.
+    const isParamStreaming = !isComplete;
+    const paramId = `${cardId}-${paramName}`;
+    PerformanceUtils.batchStreamingUpdate(paramId, () => {
+      createOrUpdateParamElement(paramsContainer!, paramName, extractedValue, cardId, isNewRender, isParamStreaming);
+    });
+  });
+
+  let completeParameters: Record<string, any> | null = null;
+  if (isComplete) {
+    completeParameters = extractJSONParameters(rawContent);
+    if (blockDiv.classList.contains('auto-expanded')) {
+      AutoExpandUtils.scheduleAutoCollapse(blockDiv, 1500);
+    }
+  }
+
+  let contentSignature: string | null = null;
+  if (isComplete && completeParameters) {
+    contentSignature = generateContentSignature(functionName, completeParameters);
+  }
+
+  if (isNewRender) {
+    if (block.parentNode) {
+      // insertBefore(card, block) in segment order stacks card0..cardN above the hidden pre.
+      block.parentNode.insertBefore(blockDiv, block);
+      blockDiv._mcpSource = block;
+      telemetry('card');
+      block.style.display = 'none';
+    } else {
+      return;
+    }
+  }
+
+  let buttonContainer = cachedElements.buttonContainer;
+  if (!buttonContainer) {
+    buttonContainer = DOMUtils.createElement<HTMLDivElement>('div', 'function-buttons');
+    // Run sits in the header row; clicks there must not toggle the card open.
+    buttonContainer.onclick = e => e.stopPropagation();
+    const headerRight = blockDiv.querySelector('.function-name-right');
+    if (headerRight) headerRight.insertBefore(buttonContainer, headerRight.querySelector('.expand-button'));
+    else blockDiv.appendChild(buttonContainer);
+
+    cachedElements.buttonContainer = buttonContainer;
+    elementQueryCache.set(blockDiv, { ...cachedElements, lastCacheTime: Date.now() });
+  }
+
+  if (isComplete) {
+    if (!blockDiv.querySelector('.raw-toggle')) {
+      addRawXmlToggle(expandableContent ?? buttonContainer!, rawContent);
+    }
+
+    if (!blockDiv.querySelector('.execute-button')) {
+      if (!completeParameters) completeParameters = extractJSONParameters(rawContent);
+      // Pass the SEGMENT string so the button parses its own name/callId/params.
+      addExecuteButton(buttonContainer!, rawContent);
+
+      const automationState = getAutomationState();
+      const autoExecuteEnabled = automationState.autoExecute;
+      const isMeta = functionName === 'get_tool_schema' || functionName === 'tool_lookup';
+      const autoDiscovery = (window as any).__mcpAutomationState?.autoDiscovery === true;
+      if (contentSignature && !executionTracker.isFunctionExecuted(callId, contentSignature, functionName)) {
+        if (isInUserMessage(block) || (autoExecuteEnabled !== true && !(isMeta && autoDiscovery))) {
+          return;
+        }
+        if (executionTracker.isBlockExecuted(cardId) === true) {
+          return;
+        }
+
+        executionTracker.markFunctionExecuted(callId, contentSignature, functionName);
+        executionTracker.markBlockExecuted(cardId);
+
+        const functionDetails = {
+          functionName,
+          callId,
+          contentSignature,
+          params: completeParameters || {},
+        };
+
+        AutoExecutionUtils.setupOptimizedAutoExecution(cardId, functionDetails);
+      }
+    }
+  }
+};
+
+/**
  * Main function to render a function call block
  */
 export const renderFunctionCall = (block: HTMLPreElement, isProcessingRef: { current: boolean }): boolean => {
+  // With the default ['pre', 'code'] targets a <code> inside a <pre> is a second target for the same
+  // call; rendering both stacks duplicate cards (and the outer pre then re-parses the inner card's text).
+  if (block.parentElement?.closest(CONFIG.targetSelectors.join(', '))) return false;
+
   injectStreamingStyles();
 
   const functionInfo = containsFunctionCalls(block);
@@ -1221,13 +1532,38 @@ export const renderFunctionCall = (block: HTMLPreElement, isProcessingRef: { cur
   }
 
   const existingFunctionBlock = document.querySelector(`.function-block[data-block-id="${blockId}"]`);
-  if (existingFunctionBlock && existingFunctionBlock.classList.contains('function-complete')) {
+  // AND with the whole-block completion (now count-based) so a multi-call block whose
+  // FIRST card completed but whose later cards are still streaming is not frozen.
+  // For single-call blocks this is unchanged: the completing render still runs (the
+  // div is not yet .function-complete at that point), later renders skip.
+  if (
+    existingFunctionBlock &&
+    existingFunctionBlock.classList.contains('function-complete') &&
+    functionInfo.isComplete
+  ) {
     if (CONFIG.debug) logger.debug(`Skipping render for completed block ${blockId}`);
     return false;
   }
 
   const preExistingIncompleteBlocks = (window as any).preExistingIncompleteBlocks || new Set<string>();
   const isPreExistingIncomplete = preExistingIncompleteBlocks.has(blockId);
+
+  // Multi-call block (jsonl only): one message may carry several function-call
+  // groups. Render one card per group and stop; the single-card path below stays
+  // byte-identical for XML and single-group JSON (this branch is never entered there).
+  if (functionInfo.detectedBlockType === 'json') {
+    const rawContentForSplit = getBlockText(block);
+    const segments = splitJSONFunctionSegments(rawContentForSplit);
+    if (segments.length > 1) {
+      processedElements.add(block);
+      block.setAttribute('data-block-id', blockId);
+      segments.forEach((seg, i) => {
+        const cardId = i === 0 ? blockId : `${blockId}-s${i}`;
+        renderCard(block, cardId, seg, analyzeJSONSegment(seg), isPreExistingIncomplete);
+      });
+      return true;
+    }
+  }
 
   let existingDiv = renderedFunctionBlocks.get(blockId);
   let isNewRender = false;
@@ -1257,7 +1593,7 @@ export const renderFunctionCall = (block: HTMLPreElement, isProcessingRef: { cur
     previousCompletionStatus = existingDiv.classList.contains('function-complete');
   }
 
-  const rawContent = block.textContent?.trim() || '';
+  const rawContent = getBlockText(block);
   const { tag, content } = extractLanguageTag(rawContent);
 
   // Determine if JSON or XML format
@@ -1471,6 +1807,8 @@ export const renderFunctionCall = (block: HTMLPreElement, isProcessingRef: { cur
   if (isNewRender) {
     if (block.parentNode) {
       block.parentNode.insertBefore(blockDiv, block);
+      blockDiv._mcpSource = block;
+      telemetry('card');
       block.style.display = 'none';
     } else {
       if (CONFIG.debug) logger.warn('Function call block has no parent element, cannot insert rendered block');
@@ -1482,8 +1820,11 @@ export const renderFunctionCall = (block: HTMLPreElement, isProcessingRef: { cur
   let buttonContainer = cachedElements.buttonContainer;
   if (!buttonContainer) {
     buttonContainer = DOMUtils.createElement<HTMLDivElement>('div', 'function-buttons');
-    buttonContainer.style.marginTop = '12px';
-    blockDiv.appendChild(buttonContainer);
+    // Run sits in the header row; clicks there must not toggle the card open.
+    buttonContainer.onclick = e => e.stopPropagation();
+    const headerRight = blockDiv.querySelector('.function-name-right');
+    if (headerRight) headerRight.insertBefore(buttonContainer, headerRight.querySelector('.expand-button'));
+    else blockDiv.appendChild(buttonContainer);
 
     cachedElements.buttonContainer = buttonContainer;
     elementQueryCache.set(blockDiv, { ...cachedElements, lastCacheTime: Date.now() });
@@ -1492,7 +1833,7 @@ export const renderFunctionCall = (block: HTMLPreElement, isProcessingRef: { cur
   // Add buttons for complete functions
   if (functionInfo.isComplete) {
     if (!blockDiv.querySelector('.raw-toggle')) {
-      addRawXmlToggle(buttonContainer!, rawContent);
+      addRawXmlToggle(expandableContent ?? buttonContainer!, rawContent);
     }
 
     if (!blockDiv.querySelector('.execute-button')) {
@@ -1508,8 +1849,13 @@ export const renderFunctionCall = (block: HTMLPreElement, isProcessingRef: { cur
       // Setup auto-execution
       const automationState = getAutomationState();
       const autoExecuteEnabled = automationState.autoExecute;
+      // Discovery meta-tools auto-run even when auto-execute is off, provided auto-discovery
+      // is enabled. `autoDiscovery` is exposed on __mcpAutomationState by automation.service.ts;
+      // read it defensively so this compiles regardless of merge order. Meta names are a fixed contract.
+      const isMeta = functionName === 'get_tool_schema' || functionName === 'tool_lookup';
+      const autoDiscovery = (window as any).__mcpAutomationState?.autoDiscovery === true;
       if (contentSignature && !executionTracker.isFunctionExecuted(callId, contentSignature, functionName)) {
-        if (autoExecuteEnabled !== true) {
+        if (isInUserMessage(block) || (autoExecuteEnabled !== true && !(isMeta && autoDiscovery))) {
           logger.debug(`Auto-execution disabled by user settings for block ${blockId} (${functionName})`);
           return true;
         }
@@ -1611,30 +1957,15 @@ export const createOrUpdateParamElement = (
       contentWrapper = elements.contentWrapper;
     }
 
-    const updateContent = () => {
-      ParamElementUtils.updateContent(preElement, displayValue, isStreaming);
-    };
-
+    // The outer batchStreamingUpdate already coalesces at ~60fps; write synchronously
+    // instead of deferring through another rAF (which added ~1 frame + risked interleaving).
+    ParamElementUtils.updateContent(preElement, displayValue, isStreaming);
     if (isStreaming) {
-      requestAnimationFrame(() => {
-        updateContent();
-        // Enhanced scroll for streaming content
-        ScrollUtils.performStreamingScroll(paramValueElement);
-      });
-    } else {
-      updateContent();
+      ScrollUtils.performStreamingScroll(paramValueElement);
     }
   } else {
     if (paramValueElement.textContent !== displayValue) {
-      if (paramValueElement.textContent && paramValueElement.textContent.length > 0) {
-        paramValueElement.style.opacity = '0.9';
-        setTimeout(() => {
-          paramValueElement.textContent = displayValue;
-          paramValueElement.style.opacity = '1';
-        }, 50);
-      } else {
-        paramValueElement.textContent = displayValue;
-      }
+      paramValueElement.textContent = displayValue;
     }
   }
 

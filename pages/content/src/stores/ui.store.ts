@@ -6,6 +6,7 @@ import type { UserPreferences, SidebarState, Notification, GlobalSettings } from
 import type { RemoteNotification, NotificationAction } from './config.store';
 import { useAppStore, type AppState } from './app.store'; // Assuming AppState includes theme
 import { createLogger } from '@extension/shared/lib/logger';
+import { telemetry } from '../utils/telemetry';
 
 
 const logger = createLogger('useUIStore');
@@ -44,7 +45,7 @@ const initialSidebarState: SidebarState = {
   width: 320, // Default width from app.store, could be synced or independent
 };
 
-const initialUserPreferences: UserPreferences = {
+export const initialUserPreferences: UserPreferences = {
   autoSubmit: false,
   autoInsert: false,   // New automation field
   autoExecute: false,  // New automation field
@@ -56,6 +57,8 @@ const initialUserPreferences: UserPreferences = {
   isMinimized: false,
   customInstructions: '',
   customInstructionsEnabled: false,
+  promptMode: 'compact', // Default to the token-efficient compact generator
+  autoDiscovery: true,   // Auto-run discovery meta-tools even when autoExecute is off
   autoInsertDelay: 2,  // Default delay in seconds
   autoExecuteDelay: 2,  // Default delay in seconds
   autoSubmitDelay: 2,   // Default delay in seconds
@@ -103,6 +106,10 @@ export const useUIStore = create<UIState>()(
         setSidebarVisibility: (visible: boolean, reason?: string) => {
           set(state => ({ sidebar: { ...state.sidebar, isVisible: visible } }));
           logger.debug(`Sidebar visibility set to ${visible}. Reason: ${reason || 'programmatic'}`);
+          // Usage statistics: the user opened the sidebar from the MCP popover.
+          if (visible && reason?.startsWith('mcp-popover-toggle')) {
+            telemetry('sidebar');
+          }
           eventBus.emit('ui:sidebar-toggle', { visible, reason: reason || 'programmatic' });
         },
 
@@ -194,17 +201,6 @@ export const useUIStore = create<UIState>()(
             timestamp: Date.now()
           });
           
-          // Emit analytics event
-          eventBus.emit('analytics:track', {
-            event: 'notification_shown',
-            parameters: {
-              notification_id: newNotification.id,
-              campaign_id: notification.campaignId,
-              type: notification.type,
-              source: 'remote'
-            }
-          });
-          
           logger.debug('[UIStore] Remote notification added:', newNotification);
           return newNotification.id;
         },
@@ -224,17 +220,6 @@ export const useUIStore = create<UIState>()(
                 notificationId: id,
                 reason: reason || 'user_dismissed',
                 timestamp: Date.now()
-              });
-              
-              // Emit analytics event
-              eventBus.emit('analytics:track', {
-                event: 'notification_dismissed',
-                parameters: {
-                  notification_id: id,
-                  campaign_id: (notification as any).campaignId,
-                  reason: reason || 'user_dismissed',
-                  source: 'remote'
-                }
               });
             }
           }
@@ -309,6 +294,18 @@ export const useUIStore = create<UIState>()(
           theme: state.theme, // Persist theme
           mcpEnabled: state.mcpEnabled, // Persist MCP toggle state across page refreshes
         }),
+        // Deep-merge preferences so newly-added keys (e.g. promptMode, autoDiscovery)
+        // fall back to their defaults for users whose persisted blob predates them.
+        // Zustand's default merge is shallow and would replace the whole preferences
+        // object, dropping any key the persisted blob doesn't contain.
+        merge: (persisted, current) => {
+          const p = (persisted ?? {}) as Partial<UIState>;
+          return {
+            ...current,
+            ...p,
+            preferences: { ...current.preferences, ...(p.preferences ?? {}) },
+          };
+        },
       }
     ),
     { name: 'UIStore', store: 'ui' }

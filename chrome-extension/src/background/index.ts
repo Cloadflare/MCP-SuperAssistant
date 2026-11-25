@@ -6,6 +6,8 @@ import {
   isMcpServerConnected,
   forceReconnectToMcpServer,
   checkMcpServerConnection,
+  onMcpConnectionStatusChange,
+  getMcpDiagnostics,
   callToolWithBackwardsCompatibility,
   getPrimitivesWithBackwardsCompatibility,
   resetMcpConnectionState,
@@ -15,8 +17,13 @@ import {
   type TransportType,
   type ConnectionRequest
 } from '../mcpclient/index';
-import { sendAnalyticsEvent, trackError, collectDemographicData } from '../../utils/analytics';
-import { analyticsService } from '../../utils/analytics-service';
+import { telemetry, TELEMETRY_ALARM, HEARTBEAT_EVERY_MINUTES } from '../../utils/telemetry';
+import { failReason, msBucket, proxyVersion, serverCount } from '../../utils/telemetry-core';
+import type { DropCause } from '../../utils/telemetry-core';
+import { telemetryStorage } from '@extension/storage';
+import { getBrowserTools, executeBrowserTool, listTabsRaw, readTabRaw } from './browser-tools';
+import { browserBridgeStorage } from '@extension/storage';
+import { initCaptureFlow, handleContentReady } from './browser-tools/capture';
 
 // Import message types for type safety
 import type {
@@ -59,6 +66,9 @@ let connectionType: ConnectionType = DEFAULT_CONNECTION_TYPE;
 let isConnected: boolean = false;
 let connectionCount: number = 0;
 let isInitialized: boolean = false;
+let mcpToolCount = 0;
+let markConnectionChecked!: () => void;
+const connectionChecked = new Promise<void>(resolve => (markConnectionChecked = resolve));
 
 /**
  * Initialize server URL from Chrome storage
@@ -66,7 +76,7 @@ let isInitialized: boolean = false;
  */
 async function initializeServerConfig(): Promise<void> {
   try {
-    const result = await chrome.storage.local.get(['mcpServerUrl', 'mcpConnectionType']);
+    const result = await chrome.storage.local.get<{ mcpServerUrl?: string; mcpConnectionType?: ConnectionType }>(['mcpServerUrl', 'mcpConnectionType']);
     
     // Load connection type first to determine default URL
     connectionType = (result.mcpConnectionType as ConnectionType) || DEFAULT_CONNECTION_TYPE;
@@ -133,7 +143,28 @@ function getConnectionStatus(): boolean {
  * Update connection status
  * Replaces mcpInterface.updateConnectionStatus()
  */
+// Connection-health telemetry (in memory; a restarted worker simply records a fresh connect).
+let connectedAt = 0;
+let pendingConnectReport = false; // sent with the tool list, once it is known
+let nextDropCause: DropCause | undefined;
+let lastProxyVersion = 'unknown';
+
 function updateConnectionStatus(status: boolean): void {
+  if (status && !isConnected) {
+    void telemetry.connected(connectionType);
+    connectedAt = Date.now();
+    pendingConnectReport = true;
+  }
+  if (!status && isConnected) {
+    void telemetry.conn.dropped({
+      transport: connectionType,
+      proxyVersion: lastProxyVersion,
+      cause: nextDropCause ?? 'other',
+      connectedMs: Date.now() - connectedAt,
+      inFlight: getMcpDiagnostics().inFlight,
+    });
+  }
+  nextDropCause = undefined;
   isConnected = status;
   logger.debug('[Background] Connection status updated to:', status);
 }
@@ -234,7 +265,6 @@ function categorizeToolError(error: Error): { isConnectionError: boolean; isTool
  * The initialization is designed to be non-blocking and resilient to failures.
  */
 async function initializeExtension() {
-  sendAnalyticsEvent('extension_loaded', {});
   logger.debug('Extension initializing...');
 
   // Initialize theme
@@ -304,8 +334,8 @@ async function initializeExtension() {
     }
   };
   
-  // Run the initial connection attempt immediately
-  checkInitialConnectionStatus();
+  // Run the initial connection attempt immediately; the telemetry heartbeat waits for it
+  checkInitialConnectionStatus().finally(markConnectionChecked);
 }
 
 /**
@@ -352,16 +382,19 @@ async function tryConnectToServer(uri: string, type: ConnectionType = connection
     }
     
     connectionAttemptCount = 0; // Reset counter on success
+    isConnecting = false; // Left true, the periodic check skipped forever and never noticed a lost server.
   } catch (error: any) {
     const errorCategory = categorizeToolError(error instanceof Error ? error : new Error(String(error)));
 
     logger.warn(`MCP server connection failed (${errorCategory.category}): ${error.message || String(error)}`);
+    void telemetry.conn.connectFailed({ transport: type, message: error?.message, attempt: connectionAttemptCount });
     logger.debug('Extension will continue to function with limited capabilities');
 
     // Only update connection status for actual connection errors
     if (errorCategory.isConnectionError) {
+      // An unreachable server is "disconnected", not an error (WebSocket said "Error" while SSE said "Disconnected").
       updateConnectionStatus(false);
-      broadcastConnectionStatusToContentScripts(false, error.message || String(error));
+      broadcastConnectionStatusToContentScripts(false);
     } else {
       logger.debug('Error categorized as tool-related, not updating connection status');
     }
@@ -387,40 +420,77 @@ async function tryConnectToServer(uri: string, type: ConnectionType = connection
   }
 }
 
+/** Applies a health result: on a change, store it, tell the pages, and on a drop start reconnecting. */
+function applyStatus(ok: boolean, cause?: DropCause): void {
+  if (ok === getConnectionStatus()) return;
+  if (!ok) nextDropCause = cause;
+  logger.debug(`Connection status changed: ${!ok} -> ${ok}`);
+  updateConnectionStatus(ok);
+  broadcastConnectionStatusToContentScripts(ok);
+  if (!ok && !isConnecting) {
+    connectionAttemptCount = 0;
+    tryConnectToServer(getServerUrl(), connectionType).catch(() => {});
+  }
+}
+
+// The client reports drops it noticed itself (WebSocket close, failed call): show them now, not at the next check.
+// Connects and deliberate disconnects are handled by their callers, so only drops are acted on.
+onMcpConnectionStatusChange(event => {
+  if (!event.dropped) return;
+  logger.debug('[Background] Connection dropped:', event.detail);
+  applyStatus(false, /websocket/i.test(event.detail ?? '') ? 'socket_closed' : 'call_lost');
+});
+
+// One health check at a time; everyone asking while it runs shares it.
+let lastHealthCheckAt = 0;
+let healthCheckInFlight: Promise<boolean> | null = null;
+function checkHealth(): Promise<boolean> {
+  healthCheckInFlight ??= checkMcpServerConnection()
+    .then(ok => {
+      lastHealthCheckAt = Date.now();
+      // also covers a check that finishes after the caller stopped waiting
+      applyStatus(ok, getMcpDiagnostics().lastHealthFailure === 'timeout' ? 'health_timeout' : 'health_unreachable');
+      return ok;
+    })
+    .finally(() => {
+      healthCheckInFlight = null;
+    });
+  return healthCheckInFlight;
+}
+
+/**
+ * Status for content scripts. Timers do not run while the worker is asleep, so the cached flag can lag:
+ * if the last real check is old, run one now (bounded, so heartbeats stay inside their 5s timeout).
+ */
+const STATUS_MAX_AGE = 10000;
+const STATUS_WAIT = 4000;
+async function getFreshConnectionStatus(): Promise<boolean> {
+  if (isConnecting || Date.now() - lastHealthCheckAt < STATUS_MAX_AGE) return getConnectionStatus();
+  const wait = new Promise<boolean>(resolve => setTimeout(() => resolve(getConnectionStatus()), STATUS_WAIT));
+  return Promise.race([checkHealth(), wait]);
+}
+
 // Set up a periodic connection check with enhanced recovery logic
-const PERIODIC_CHECK_INTERVAL = 60000; // 1 minute
+const PERIODIC_CHECK_INTERVAL = 15000; // real ping each time, so a stopped proxy shows within ~15s
 setInterval(async () => {
   if (isConnecting) {
     return; // Skip if already connecting
   }
 
-  // Check current connection status with enhanced validation
+  // checkHealth applies a change (store, broadcast, start reconnect) itself.
   const wasConnected = getConnectionStatus();
-  const isConnected = await checkMcpServerConnection();
-  updateConnectionStatus(isConnected);
+  const isConnected = await checkHealth();
 
-  // Broadcast status change if it changed
-  if (wasConnected !== isConnected) {
-    logger.debug(`Connection status changed: ${wasConnected} -> ${isConnected}`);
-    broadcastConnectionStatusToContentScripts(isConnected);
-    
-    // If connected, also broadcast available tools
-    if (isConnected) {
-      try {
-        logger.debug('[Background] Periodic check: Connection established, fetching and broadcasting tools...');
-        const primitives = await getPrimitivesWithBackwardsCompatibility(getServerUrl(), true, connectionType);
-        logger.debug(`Periodic check: Retrieved ${primitives.length} primitives`);
-        
-        const tools = normalizeTools(primitives);
-        logger.debug(`Periodic check: Broadcasting ${tools.length} normalized tools`);
-        
-        broadcastToolsUpdateToContentScripts(tools);
-      } catch (error) {
-        logger.warn('[Background] Error broadcasting tools after status change:', error);
-      }
+  if (isConnected && !wasConnected) {
+    // Came back without tryConnectToServer: also hand the pages the tools.
+    try {
+      const primitives = await getPrimitivesWithBackwardsCompatibility(getServerUrl(), true, connectionType);
+      broadcastToolsUpdateToContentScripts(normalizeTools(primitives));
+    } catch (error) {
+      logger.warn('[Background] Error broadcasting tools after status change:', error);
     }
-  } else {
-    // Even if status didn't change, periodically broadcast to ensure content scripts are in sync
+  } else if (wasConnected === isConnected) {
+    // Keep content scripts in sync even when nothing changed.
     broadcastConnectionStatusToContentScripts(isConnected);
   }
 
@@ -455,35 +525,22 @@ setInterval(() => {
 // --- Error Handling ---
 // Listen for unhandled errors in the service worker
 // Note: This may not catch all async errors perfectly depending on how they propagate
+// Telemetry gets a code only, never the message or stack.
 self.addEventListener('unhandledrejection', event => {
   logger.error('Unhandled rejection in service worker:', event.reason);
-  if (event.reason instanceof Error) {
-    trackError(event.reason, 'background_unhandled_rejection');
-  } else {
-    // Handle non-Error rejections if necessary
-    sendAnalyticsEvent('extension_error', {
-      error_message: `Unhandled rejection: ${JSON.stringify(event.reason)}`,
-      error_context: 'background_unhandled_rejection_non_error',
-    });
-  }
+  void telemetry.error('sw_unhandled');
 });
 
 self.addEventListener('error', event => {
   logger.error('Uncaught error in service worker:', event.error);
-  if (event.error instanceof Error) {
-    trackError(event.error, 'background_uncaught_error');
-  } else {
-    sendAnalyticsEvent('extension_error', {
-      error_message: `Uncaught error: ${event.message}`,
-      error_context: 'background_uncaught_error_non_error',
-    });
-  }
+  void telemetry.error('sw_unhandled');
 });
 
 // --- Lifecycle Events ---
 
 chrome.runtime.onInstalled.addListener(async details => {
   logger.debug('Extension installed or updated:', details.reason);
+  void telemetry.installed(details.reason, details.previousVersion);
 
   const currentVersion = chrome.runtime.getManifest().version;
   const installDate = new Date().toISOString();
@@ -492,33 +549,7 @@ chrome.runtime.onInstalled.addListener(async details => {
   if (details.reason === 'install') {
     logger.debug('Performing first-time installation setup.');
 
-    // Collect demographic data for user properties
-    const demographicData = collectDemographicData();
-
-    // Set install date and user properties for Remote Config targeting
-    await chrome.storage.local.set({
-      installDate,
-      version: currentVersion,
-      userProperties: {
-        extension_version: currentVersion,
-        install_date: installDate,
-        ...demographicData,
-      }
-    });
-
-    // Initialize analytics user properties
-    await analyticsService.updateUserProperties({
-      extension_version: currentVersion,
-      install_date: installDate,
-      ...demographicData,
-    });
-
-    // Track installation with enhanced data
-    sendAnalyticsEvent('extension_installed', {
-      reason: details.reason,
-      extension_version: currentVersion,
-      ...demographicData,
-    });
+    await chrome.storage.local.set({ installDate, version: currentVersion });
 
     // Initialize Remote Config after installation
     if (remoteConfigManager && remoteConfigManager.initialized) {
@@ -529,28 +560,11 @@ chrome.runtime.onInstalled.addListener(async details => {
     const previousVersion = details.previousVersion || 'unknown';
     logger.debug(`Extension updated from ${previousVersion} to ${currentVersion}`);
 
-    const demographicData = collectDemographicData();
-
     // Store version information
     await chrome.storage.local.set({
       version: currentVersion,
       previousVersion: previousVersion,
       lastUpdateDate: new Date().toISOString()
-    });
-
-    // Update analytics user properties
-    await analyticsService.updateUserProperties({
-      extension_version: currentVersion,
-      previous_version: previousVersion,
-      ...demographicData,
-    });
-
-    // Track update with enhanced data
-    sendAnalyticsEvent('extension_installed', {
-      reason: details.reason,
-      extension_version: currentVersion,
-      previous_version: previousVersion,
-      ...demographicData,
     });
 
     // Notify Remote Config about version update
@@ -585,7 +599,6 @@ chrome.runtime.onInstalled.addListener(async details => {
 
 chrome.runtime.onStartup.addListener(() => {
   logger.debug('Browser startup detected.');
-  sendAnalyticsEvent('browser_startup', {});
   // Re-check connection on startup
   initializeExtension().catch(err => logger.error('Error initializing on startup:', err));
 });
@@ -598,10 +611,57 @@ initializeExtension()
   .catch(error => {
     logger.error('Error during extension initialization:', error);
     logger.debug('Extension will continue running with limited functionality');
+    markConnectionChecked();
   });
+
+// --- Telemetry: daily heartbeat + rollup, once the initial connection check has settled ---
+const telemetryTick = () =>
+  connectionChecked.then(() => telemetry.tick({ connected: isConnected, transport: connectionType, tools: mcpToolCount }));
+void telemetryTick();
+void telemetry.setUninstallUrl();
+telemetryStorage.subscribe(() => void telemetry.setUninstallUrl());
+chrome.alarms.get(TELEMETRY_ALARM).then(a => {
+  // Re-creating on every worker start would reset the period, so only create it once.
+  if (!a) void chrome.alarms.create(TELEMETRY_ALARM, { periodInMinutes: HEARTBEAT_EVERY_MINUTES });
+});
+chrome.alarms.onAlarm.addListener(a => {
+  if (a.name === TELEMETRY_ALARM) void telemetryTick();
+void telemetry.setUninstallUrl();
+telemetryStorage.subscribe(() => void telemetry.setUninstallUrl());
+});
 
 logger.debug('Background script loaded');
 logger.debug("Edit 'chrome-extension/src/background/index.ts' and save to reload.");
+
+// --- Browser Bridge wiring ---
+initCaptureFlow();
+
+// When browser-bridge settings change (e.g. tools toggled on/off), re-broadcast the
+// merged tool list so the sidebar reflects the new toggle immediately.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes['browser-bridge-settings']) return;
+  (async () => {
+    let mcpTools: any[] = [];
+    if (isMcpServerConnected()) {
+      try {
+        const primitives = await getPrimitivesWithBackwardsCompatibility(getServerUrl(), false, connectionType);
+        mcpTools = normalizeTools(primitives);
+      } catch (error) {
+        logger.warn('[Background] Could not refresh MCP tools on settings change:', error);
+      }
+    }
+    broadcastToolsUpdateToContentScripts(mcpTools);
+  })().catch(err => logger.error('[Background] Error broadcasting tools on settings change:', err));
+});
+
+// Granting browser access (from Settings or the access window) turns the AI browser tools on;
+// the user can still switch either toggle off afterwards.
+chrome.permissions.onAdded.addListener(p => {
+  if (!p.origins?.includes('<all_urls>')) return;
+  void browserBridgeStorage.set(s => ({ ...s, browserToolsEnabled: true, browserControlEnabled: true }));
+});
+
+let grantWindowId: number | undefined;
 
 // --- Enhanced Message Handling ---
 
@@ -615,36 +675,105 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     from: sender.tab ? `tab-${sender.tab.id}` : 'extension'
   });
 
-  // Handle MCP client connection status changes
-  if (message.type === 'mcp:connection-status-changed' && message.origin === 'mcpclient') {
-    logger.debug('[Background] Received connection status change from MCP client:', message.payload);
-    
-    // Update internal connection status
-    const { isConnected, error } = message.payload;
-    updateConnectionStatus(isConnected);
-    
-    // Broadcast the status change to all content scripts
-    broadcastConnectionStatusToContentScripts(isConnected, error);
-    
-    // No response needed
+  // Browser Bridge: content script announcing it's ready to receive a queued capture
+  if (message.type === 'browser-bridge:content-ready') {
+    handleContentReady(sender, sendResponse);
+    return true; // Async response
+  }
+
+  // Browser Bridge: user-initiated tab picker (NOT an AI tool call; not gated on browserToolsEnabled).
+  // Still enforces denylist / excluded hosts / <all_urls> via the shared raw helpers.
+  if (message.type === 'browser-bridge:list-tabs') {
+    (async () => {
+      const { domainDenylist } = await browserBridgeStorage.get();
+      const [tabs, hasAllUrls] = await Promise.all([
+        listTabsRaw(domainDenylist),
+        chrome.permissions.contains({ origins: ['<all_urls>'] }),
+      ]);
+      sendResponse({ success: true, tabs, senderTabId: sender.tab?.id, hasAllUrls });
+    })().catch(e => sendResponse({ success: false, error: String(e) }));
+    return true; // Async response
+  }
+
+  if (message.type === 'browser-bridge:get-tab-content') {
+    const { tabId, maxChars } = message.payload ?? {};
+    readTabRaw(Number(tabId), { maxChars })
+      .then(r => {
+        if (r.ok) void telemetry.record('tab_attach', sender.url ?? sender.tab?.url);
+        sendResponse(
+          r.ok
+            ? { success: true, title: r.title, url: r.url, content: r.content, truncated: r.truncated }
+            : { success: false, error: r.error, needsPermission: r.needsPermission },
+        );
+      })
+      .catch(e => sendResponse({ success: false, error: String(e) }));
+    return true; // Async response
+  }
+
+  // Content scripts can't call chrome.permissions.request, so open a small extension window
+  // centered over the sender's window; one click there brings up Chrome's own prompt.
+  // Firefox only: usage statistics need the browser's data consent, which updaters were never asked for.
+  if (message.type === 'telemetry:consent-needed') {
+    (async () => {
+      const perms = (await chrome.permissions.getAll()) as { data_collection?: string[] };
+      const { consentPromptDismissed } = await chrome.storage.local.get('consentPromptDismissed');
+      const needed =
+        !!perms.data_collection &&
+        !perms.data_collection.includes('technicalAndInteraction') &&
+        (await telemetryStorage.get()).enabled &&
+        !consentPromptDismissed;
+      sendResponse({ needed });
+    })().catch(() => sendResponse({ needed: false }));
+    return true;
+  }
+  if (message.type === 'telemetry:consent-dismiss') {
+    void chrome.storage.local.set({ consentPromptDismissed: true });
     return false;
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Legacy analytics bridge                                             */
-  /* ------------------------------------------------------------------ */
-  if (message.command === 'trackAnalyticsEvent') {
-    if (message.eventName && message.eventParams) {
-      sendAnalyticsEvent(message.eventName, message.eventParams)
-        .then(() => sendResponse({ success: true }))
-        .catch(error => {
-          logger.error('[Background] Error tracking analytics event from message:', error);
-          sendResponse({ success: false, error: error instanceof Error ? error.message : String(error) });
-        });
-      return true; // Async response
+  if (message.type === 'browser-bridge:request-access' || message.type === 'telemetry:request-consent') {
+    const page = message.type === 'telemetry:request-consent' ? '#consent' : '#grant';
+    (async () => {
+      // Re-clicking "Allow access" focuses the open window instead of stacking another.
+      if (grantWindowId !== undefined) {
+        try {
+          await chrome.windows.update(grantWindowId, { focused: true });
+          return;
+        } catch {
+          grantWindowId = undefined; // closed since
+        }
+      }
+      const width = 420;
+      const height = 280;
+      const parent = sender.tab ? await chrome.windows.get(sender.tab.windowId) : undefined;
+      const left = parent?.left !== undefined ? Math.round(parent.left + ((parent.width ?? width) - width) / 2) : undefined;
+      const top = parent?.top !== undefined ? Math.round(parent.top + ((parent.height ?? height) - height) / 3) : undefined;
+      const win = await chrome.windows.create({
+        url: chrome.runtime.getURL(`options/index.html${page}`),
+        type: 'popup',
+        width,
+        height,
+        left,
+        top,
+        focused: true,
+      });
+      grantWindowId = win?.id;
+    })().catch(e => logger.warn('[Background] Could not open access window:', e));
+    return false;
+  }
+
+  // Usage statistics from content scripts: only these features; the site comes from the sender URL.
+  if (message.type === 'telemetry') {
+    const where = sender.url ?? sender.tab?.url;
+    if (sender.tab && ['auto_execute', 'chip', 'sidebar'].includes(message.feature)) {
+      void telemetry.record(message.feature, where);
+    } else if (sender.tab && message.feature === 'instructions') {
+      void telemetry.instructions(where);
+    } else if (sender.tab && message.feature === 'card') {
+      void telemetry.card(where);
+    } else if (sender.tab && message.feature === 'setup_copy') {
+      void telemetry.setupCopied(where);
     }
-    logger.warn('[Background] Invalid trackAnalyticsEvent message received:', message);
-    sendResponse({ success: false, error: 'Invalid eventName or eventParams' });
     return false;
   }
 
@@ -699,9 +828,34 @@ async function handleMcpMessage(
           throw new Error('Tool name is required');
         }
 
-        logger.debug(`Calling tool: ${toolName} from adapter: ${adapterName || 'unknown'}`);
-        result = await callToolWithBackwardsCompatibility(getServerUrl(), toolName, args || {}, adapterName);
-        logger.debug(`Tool call completed: ${toolName}`);
+        // Virtual browser tools execute locally in the background, not over MCP.
+        const isBrowserTool = toolName.startsWith('browser_');
+        const where = sender.url ?? sender.tab?.url;
+        const callStart = Date.now();
+        const callCtx = () => ({ transport: connectionType, proxy_version: lastProxyVersion, duration: msBucket(Date.now() - callStart) });
+        try {
+          if (isBrowserTool) {
+            logger.debug(`Executing local browser tool: ${toolName}`);
+            result = await executeBrowserTool(toolName, args || {}, sender);
+          } else {
+            logger.debug(`Calling tool: ${toolName} from adapter: ${adapterName || 'unknown'}`);
+            result = await callToolWithBackwardsCompatibility(getServerUrl(), toolName, args || {}, adapterName);
+          }
+          logger.debug(`Tool call completed: ${toolName}`);
+        } catch (error) {
+          const reason = failReason(error instanceof Error ? error.message : String(error));
+          if (!isBrowserTool) void telemetry.conn.toolCall({ ok: false, reason, ms: Date.now() - callStart });
+          void telemetry
+            .toolRun(isBrowserTool, false, where)
+            .then(() => telemetry.error('tool_failed', where, reason, isBrowserTool ? {} : callCtx()));
+          throw error;
+        }
+        const toolOk = result?.isError !== true;
+        if (!isBrowserTool)
+          void telemetry.conn.toolCall({ ok: toolOk, reason: toolOk ? undefined : 'tool_error', ms: Date.now() - callStart });
+        void telemetry
+          .toolRun(isBrowserTool, toolOk, where)
+          .then(() => (toolOk ? undefined : telemetry.error('tool_failed', where, 'tool_error', isBrowserTool ? {} : callCtx())));
         break;
       }
 
@@ -709,17 +863,7 @@ async function handleMcpMessage(
         logger.debug('[Background] Getting current connection status');
         
         // Double-check the connection status to ensure accuracy
-        const storedStatus = getConnectionStatus();
-        const actualStatus = await checkMcpServerConnection();
-        
-        logger.debug(`Stored status: ${storedStatus}, Actual status: ${actualStatus}`);
-        
-        // Update stored status if they don't match
-        if (storedStatus !== actualStatus) {
-          logger.debug('[Background] Status mismatch detected, updating and broadcasting...');
-          updateConnectionStatus(actualStatus);
-          broadcastConnectionStatusToContentScripts(actualStatus);
-        }
+        const actualStatus = await getFreshConnectionStatus(); // applies and broadcasts a change itself
         
         result = { 
           status: actualStatus ? 'connected' : 'disconnected',
@@ -732,26 +876,30 @@ async function handleMcpMessage(
       case 'mcp:get-tools': {
         const { forceRefresh = false } = payload as GetToolsRequest;
         logger.debug(`Getting tools (forceRefresh: ${forceRefresh})`);
-        
+
+        let mcpTools: any[] = [];
         try {
           const primitives = await getPrimitivesWithBackwardsCompatibility(getServerUrl(), forceRefresh, connectionType);
           logger.debug(`Retrieved ${primitives.length} primitives from server`);
-          
+
           // Use the helper function to normalize tools with proper schema handling
-          const tools = normalizeTools(primitives);
-          logger.debug(`Returning ${tools.length} normalized tools to content script`);
-          
-          result = tools;
+          mcpTools = normalizeTools(primitives);
+          logger.debug(`Returning ${mcpTools.length} normalized tools to content script`);
         } catch (error) {
           logger.error('[Background] Error getting tools:', error);
-          // Return empty array instead of throwing to prevent UI crashes
-          result = [];
+          // Keep going with an empty MCP list so virtual browser tools still surface.
+          mcpTools = [];
         }
+
+        // Merge virtual browser tools (gated on browserToolsEnabled) even when MCP is down.
+        const browserTools = await getBrowserTools();
+        result = [...mcpTools, ...browserTools];
         break;
       }
 
       case 'mcp:force-reconnect': {
         logger.debug('[Background] Force reconnect requested via context bridge');
+        void telemetry.conn.manualReconnect();
         
         try {
           // Broadcast reconnection started status
@@ -775,7 +923,8 @@ async function handleMcpMessage(
           // Update connection status
           const isConnected = await checkMcpServerConnection();
           updateConnectionStatus(isConnected);
-          
+          pendingConnectReport ||= isConnected; // report the (possibly new) proxy version and tool count
+
           // Broadcast the new status to all content scripts
           broadcastConnectionStatusToContentScripts(isConnected);
           
@@ -798,6 +947,11 @@ async function handleMcpMessage(
           result = { isConnected, message: 'Reconnection completed' };
         } catch (error) {
           logger.error('[Background] Force reconnect failed:', error);
+          void telemetry.conn.connectFailed({
+            transport: connectionType,
+            message: error instanceof Error ? error.message : String(error),
+            attempt: 1,
+          });
           
           // Update connection status
           const isConnected = await checkMcpServerConnection();
@@ -813,7 +967,7 @@ async function handleMcpMessage(
       }
 
       case 'mcp:get-server-config': {
-        const stored = await chrome.storage.local.get(['mcpServerUrl', 'mcpConnectionType']);
+        const stored = await chrome.storage.local.get<{ mcpServerUrl?: string; mcpConnectionType?: ConnectionType }>(['mcpServerUrl', 'mcpConnectionType']);
         const defaultUrl = connectionType === 'websocket' ? DEFAULT_WEBSOCKET_URL : DEFAULT_SSE_URL;
         result = { 
           uri: stored.mcpServerUrl || defaultUrl,
@@ -855,9 +1009,11 @@ async function handleMcpMessage(
         const reconnectPromise = (async () => {
           try {
             logger.debug('[Background] Starting async reconnection after config update...');
+            void telemetry.conn.manualReconnect();
             await forceReconnectToMcpServer(config.uri, newType);
             const isConnected = await checkMcpServerConnection();
             updateConnectionStatus(isConnected);
+            pendingConnectReport ||= isConnected;
             broadcastConnectionStatusToContentScripts(isConnected);
             logger.debug(`Async reconnection completed, connected: ${isConnected}`);
             
@@ -874,6 +1030,11 @@ async function handleMcpMessage(
             }
           } catch (error) {
             logger.warn('[Background] Async reconnect after config update failed:', error);
+            void telemetry.conn.connectFailed({
+              transport: newType,
+              message: error instanceof Error ? error.message : String(error),
+              attempt: 1,
+            });
             const isConnected = await checkMcpServerConnection();
             updateConnectionStatus(isConnected);
             const errorMessage = error instanceof Error ? error.message : String(error);
@@ -893,7 +1054,7 @@ async function handleMcpMessage(
       case 'mcp:heartbeat': {
         // Handle heartbeat from content script
         const { timestamp } = payload;
-        const isConnected = isMcpServerConnected();
+        const isConnected = await getFreshConnectionStatus();
         
         result = {
           timestamp: Date.now(),
@@ -1001,9 +1162,25 @@ function broadcastConnectionStatusToContentScripts(isConnected: boolean, error?:
  * 
  * @param tools - Array of available MCP tools
  */
-function broadcastToolsUpdateToContentScripts(tools: any[]) {
+async function broadcastToolsUpdateToContentScripts(mcpTools: any[]) {
+  mcpToolCount = mcpTools.length;
+  if (isConnected) void telemetry.toolsListed(connectionType, mcpTools.length);
+  if (isConnected && pendingConnectReport) {
+    pendingConnectReport = false;
+    const d = getMcpDiagnostics();
+    lastProxyVersion = proxyVersion(d.serverName, d.serverVersion);
+    void telemetry.conn.connected({
+      transport: connectionType,
+      proxyVersion: lastProxyVersion,
+      tools: mcpTools.length,
+      servers: serverCount(mcpTools.map(t => String(t?.name ?? ''))),
+    });
+  }
+  // Always fold in the virtual browser tools (gated internally on settings).
+  const browserTools = await getBrowserTools();
+  const tools = [...mcpTools, ...browserTools];
   logger.debug(`Broadcasting tools update to content scripts: ${tools.length} tools`);
-  
+
   const broadcastMessage: BaseMessage & { payload: ToolUpdateBroadcast } = {
     type: 'mcp:tool-update',
     payload: {
@@ -1012,7 +1189,7 @@ function broadcastToolsUpdateToContentScripts(tools: any[]) {
     origin: 'background',
     timestamp: Date.now()
   };
-  
+
   chrome.tabs.query({}, (tabs) => {
     tabs.forEach(tab => {
       if (tab.id) {

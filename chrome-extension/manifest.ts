@@ -23,7 +23,9 @@ const manifest = {
   name: 'MCP SuperAssistant',
   browser_specific_settings: {
     gecko: {
-      id: 'saurabh@mcpsuperassistant.ai',
+      id: 'admin@mcpsuperassistant.ai', // must match the published AMO listing
+      // Firefox 140+ built-in consent; telemetry.ts honours it.
+      data_collection_permissions: { required: ['none'], optional: ['technicalAndInteraction'] },
     },
   },
   version: packageJson.version,
@@ -45,14 +47,25 @@ const manifest = {
     '*://*.github.com/*',
     '*://*.copilot.github.com/*',
     '*://*.kimi.com/*',
+    '*://*.kimi.ai/*',
     '*://*.chat.z.ai/*',
     '*://*.chat.qwen.ai/*',
+    '*://*.claude.ai/*',
 
   ],
 
-  permissions: ['storage', 'clipboardWrite'],
-  // permissions: ['storage', 'scripting', 'clipboardWrite'],
-  // options_page: 'options/index.html',
+  permissions: ['storage', 'clipboardWrite', 'tabs', 'scripting', 'activeTab', 'alarms'],
+  optional_host_permissions: ['<all_urls>'],
+  options_page: 'options/index.html',
+  commands: {
+    'capture-page': {
+      suggested_key: {
+        default: 'Alt+Shift+A',
+        mac: 'Alt+Shift+A',
+      },
+      description: 'Send current page to your AI',
+    },
+  },
   background: {
     service_worker: 'background.js',
     type: 'module',
@@ -148,7 +161,7 @@ const manifest = {
     },
     // Specific content script for Kimi
     {
-      matches: ['*://*.kimi.com/*'],
+      matches: ['*://*.kimi.com/*', '*://*.kimi.ai/*'],
       js: ['content/index.iife.js'],
       run_at: 'document_idle',
     },
@@ -160,6 +173,12 @@ const manifest = {
     },
     {
       matches: ['*://*.chat.qwen.ai/*'],
+      js: ['content/index.iife.js'],
+      run_at: 'document_idle',
+    },
+    // Specific content script for Claude.ai tool call parsing
+    {
+      matches: ['*://*.claude.ai/*'],
       js: ['content/index.iife.js'],
       run_at: 'document_idle',
     },

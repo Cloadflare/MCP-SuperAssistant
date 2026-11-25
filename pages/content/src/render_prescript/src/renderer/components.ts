@@ -1,7 +1,5 @@
-import type { ParamValueElement } from '../core/types';
-import { StabilizedBlock } from '../core/types';
 import { CONFIG } from '../core/config';
-import { safelySetContent } from '../utils/index';
+import { safelySetContent, scheduleWork } from '../utils/index';
 import { storeExecutedFunction, generateContentSignature } from '../mcpexecute/storage';
 import { checkAndDisplayFunctionHistory, createHistoryPanel, updateHistoryPanel } from './functionHistory';
 import { extractJSONParameters, stripLanguageTags, extractCleanContent } from '../parser/jsonFunctionParser';
@@ -97,6 +95,9 @@ function adapterSupportsCapability(capability: string): boolean {
 
 // Performance optimizations: Cache constants and pre-compile regexes
 const MAX_INSERT_LENGTH = 39000;
+const MAX_RESULT_DISPLAY_CHARS = 20000; // ponytail: hard display cap; raw text stays intact for insert/copy
+
+const formatDuration = (ms: number): string => (ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`);
 const WEBSITE_NAME_FOR_MAX_INSERT_LENGTH_CHECK = ['perplexity'];
 const websiteName = window.location.hostname
   .toLowerCase()
@@ -242,7 +243,7 @@ export const addRawXmlToggle = (blockDiv: HTMLDivElement, rawContent: string): v
   // Create toggle button with optimized element creation
   const toggleBtn = createOptimizedElement('button', {
     className: 'raw-toggle',
-    innerHTML: `${ICONS.CODE}<span>Show Raw Info</span>`,
+    innerHTML: `${ICONS.CODE}<span>View raw</span>`,
     styles: {
       display: 'flex',
       alignItems: 'center',
@@ -262,7 +263,7 @@ export const addRawXmlToggle = (blockDiv: HTMLDivElement, rawContent: string): v
     // Use requestAnimationFrame for smooth visual updates
     requestAnimationFrame(() => {
       rawXmlContainer.style.display = isVisible ? 'block' : 'none';
-      textSpan.textContent = isVisible ? 'Hide Raw Info' : 'Show Raw Info';
+      textSpan.textContent = isVisible ? 'Hide raw' : 'View raw';
     });
   };
 
@@ -278,298 +279,6 @@ export const addRawXmlToggle = (blockDiv: HTMLDivElement, rawContent: string): v
   // Single batch DOM update
   blockDiv.appendChild(fragment);
   targetParent.appendChild(rawXmlContainer);
-};
-
-/**
- * Setup auto-scroll functionality for parameter value divs
- *
- * @param paramValueDiv Parameter value div element
- */
-export const setupAutoScroll = (paramValueDiv: ParamValueElement): void => {
-  // Auto scroll disabled.
-};
-
-/**
- * Stabilize block height to prevent layout shifts during updates
- *
- * @param block The block element
- */
-export const stabilizeBlock = (block: HTMLElement): void => {
-  if (block.style.height === '') {
-    const rect = block.getBoundingClientRect();
-    block.style.height = `${rect.height}px`;
-    block.style.overflow = 'hidden'; // Optional: prevent content overflow during transition
-    if (CONFIG.debug) logger.debug(`Stabilized block height: ${rect.height}px`);
-  }
-};
-
-/**
- * Remove stabilized height
- *
- * @param block The block element
- */
-export const unstabilizeBlock = (block: HTMLElement): void => {
-  if (block.style.height !== '') {
-    block.style.height = '';
-    block.style.overflow = ''; // Reset overflow
-    if (CONFIG.debug) logger.debug('Unstabilized block height');
-  }
-};
-
-/**
- * Optimized smooth block content update with improved performance
- * Reduces DOM operations and uses efficient transition management
- *
- * @param block The function block to update
- * @param newContent New HTML content to place inside the block
- * @param isStreaming Whether the content is still streaming
- */
-export const smoothlyUpdateBlockContent = (
-  block: HTMLElement,
-  newContent: string | HTMLElement,
-  isStreaming: boolean = false,
-): void => {
-  if (!block) return;
-
-  // Performance: Check update lock more efficiently
-  if (!isStreaming && block.hasAttribute('data-smooth-updating')) return;
-
-  // Skip updates for completed blocks to prevent jitter
-  const blockId = block.getAttribute('data-block-id');
-  if (blockId && (window as any).completedStreams?.has(blockId)) {
-    if (CONFIG.debug) logger.debug(`Skipping update for completed block ${blockId}`);
-    return;
-  }
-
-  // Skip updates if block is currently resyncing
-  if (blockId && (window as any).resyncingBlocks?.has(blockId)) {
-    if (CONFIG.debug) logger.debug(`Skipping update for resyncing block ${blockId}`);
-    return;
-  }
-
-  // Cache essential properties for performance
-  const originalClasses = Array.from(block.classList);
-  const originalParent = block.parentNode;
-
-  // Mark block as updating
-  block.setAttribute('data-smooth-updating', 'true');
-
-  // Performance: Cache dimensions and scroll state
-  const originalRect = block.getBoundingClientRect();
-  const scrollState = {
-    top: block.scrollTop,
-    height: block.scrollHeight,
-    clientHeight: block.clientHeight,
-    wasScrollable: block.scrollHeight > block.clientHeight,
-  };
-
-  // Optimized shadow tracker creation
-  const shadowTracker = createOptimizedElement('div', {
-    styles: { display: 'none' },
-    attributes: {
-      'data-shadow-for': blockId || 'unknown-block',
-      'data-update-in-progress': 'true',
-    },
-  });
-
-  if (originalParent) {
-    originalParent.insertBefore(shadowTracker, block.nextSibling);
-  }
-
-  // Performance: Use more efficient content parsing
-  const parseNewContent = (content: string | HTMLElement): DocumentFragment => {
-    const fragment = document.createDocumentFragment();
-
-    if (typeof content === 'string') {
-      // Optimized parsing with better error handling
-      try {
-        const template = document.createElement('template');
-        template.innerHTML = content;
-        fragment.appendChild(template.content);
-      } catch (e) {
-        // Fallback for CSP-restricted environments
-        const div = document.createElement('div');
-        div.textContent = content;
-        fragment.appendChild(div);
-      }
-    } else {
-      fragment.appendChild(content.cloneNode(true));
-    }
-
-    return fragment;
-  };
-
-  // Pre-calculate new content dimensions efficiently
-  const measureNewContent = (fragment: DocumentFragment): number => {
-    const tempContainer = createOptimizedElement('div', {
-      styles: {
-        position: 'absolute',
-        visibility: 'hidden',
-        width: `${originalRect.width}px`,
-        left: '-9999px',
-      },
-    });
-
-    tempContainer.appendChild(fragment.cloneNode(true));
-    document.body.appendChild(tempContainer);
-    const height = tempContainer.offsetHeight;
-    document.body.removeChild(tempContainer);
-    ElementPool.release(tempContainer);
-
-    return height;
-  };
-
-  const newContentFragment = parseNewContent(newContent);
-  const newHeight = measureNewContent(newContentFragment);
-
-  // Optimized transition setup with batch style assignment
-  const transitionDuration = isStreaming ? 150 : 250;
-  Object.assign(block.style, {
-    height: `${originalRect.height}px`,
-    overflow: 'hidden',
-    transition: `height ${transitionDuration}ms ease-in-out`,
-  });
-
-  // Efficient content wrapper management
-  const createContentWrapper = (className: string, opacity: string = '1'): HTMLElement => {
-    return createOptimizedElement('div', {
-      className: `function-content-wrapper ${className}`,
-      styles: {
-        opacity,
-        transform: opacity === '0' ? 'translateY(10px)' : 'translateY(0)',
-        transition: `opacity ${transitionDuration * 0.6}ms ease-out, transform ${transitionDuration * 0.6}ms ease-out`,
-      },
-    });
-  };
-
-  // Move existing content to wrapper
-  const oldWrapper = createContentWrapper('function-content-old');
-  while (block.firstChild) {
-    oldWrapper.appendChild(block.firstChild);
-  }
-
-  // Create new content wrapper
-  const newWrapper = createContentWrapper('function-content-new', '0');
-  newWrapper.appendChild(newContentFragment);
-
-  // Batch DOM operations
-  const fragment = document.createDocumentFragment();
-  fragment.appendChild(oldWrapper);
-  fragment.appendChild(newWrapper);
-  block.appendChild(fragment);
-
-  // Use requestAnimationFrame for smoother animations
-  requestAnimationFrame(() => {
-    // Start height transition
-    block.style.height = `${newHeight}px`;
-
-    // Fade out old content
-    Object.assign(oldWrapper.style, {
-      opacity: '0',
-      transform: 'translateY(-10px)',
-    });
-
-    // Delayed fade in of new content
-    setTimeout(
-      () => {
-        requestAnimationFrame(() => {
-          Object.assign(newWrapper.style, {
-            opacity: '1',
-            transform: 'translateY(0)',
-          });
-        });
-      },
-      isStreaming ? 30 : 50,
-    );
-  });
-
-  // Optimized mutation observer for DOM changes
-  let blockRemoved = false;
-  let replacementBlock: HTMLElement | null = null;
-
-  const observer = new MutationObserver(mutations => {
-    for (const mutation of mutations) {
-      if (mutation.type === 'childList' && Array.from(mutation.removedNodes).includes(block)) {
-        blockRemoved = true;
-
-        // Efficiently find replacement block
-        const addedElement = Array.from(mutation.addedNodes).find(
-          (node): node is HTMLElement =>
-            node.nodeType === Node.ELEMENT_NODE &&
-            (node as HTMLElement).classList.contains('function-block') &&
-            (node as HTMLElement).getAttribute('data-block-id') === blockId,
-        ) as HTMLElement | undefined;
-
-        if (addedElement) {
-          replacementBlock = addedElement;
-        }
-
-        observer.disconnect();
-        return;
-      }
-    }
-  });
-
-  observer.observe(originalParent || document.body, { childList: true, subtree: true });
-
-  // Optimized cleanup with better performance
-  setTimeout(() => {
-    observer.disconnect();
-
-    if (blockRemoved && replacementBlock) {
-      // Efficiently transfer state to replacement
-      originalClasses.forEach(cls => {
-        if (!replacementBlock!.classList.contains(cls)) {
-          replacementBlock!.classList.add(cls);
-        }
-      });
-
-      // Batch style cleanup
-      Object.assign(replacementBlock.style, {
-        transition: '',
-        height: '',
-        overflow: '',
-      });
-
-      replacementBlock.removeAttribute('data-smooth-updating');
-
-      if (scrollState.wasScrollable) {
-        replacementBlock.scrollTop = scrollState.top;
-      }
-    } else if (document.body.contains(block)) {
-      // Efficient content finalization
-      while (newWrapper.firstChild) {
-        block.appendChild(newWrapper.firstChild);
-      }
-
-      // Batch remove old elements
-      [oldWrapper, newWrapper].forEach(wrapper => {
-        if (block.contains(wrapper)) {
-          ElementPool.release(wrapper);
-          block.removeChild(wrapper);
-        }
-      });
-
-      // Batch style reset
-      Object.assign(block.style, {
-        height: '',
-        overflow: '',
-        transition: '',
-      });
-
-      if (scrollState.wasScrollable) {
-        block.scrollTop = scrollState.top;
-      }
-
-      block.removeAttribute('data-smooth-updating');
-    }
-
-    // Cleanup shadow tracker
-    if (shadowTracker.parentNode) {
-      shadowTracker.parentNode.removeChild(shadowTracker);
-      ElementPool.release(shadowTracker);
-    }
-  }, transitionDuration + 50);
 };
 
 /**
@@ -664,11 +373,10 @@ export const addExecuteButton = (blockDiv: HTMLDivElement, rawContent: string): 
 
   // Create optimized results panel
   const resultsPanel = createOptimizedElement('div', {
-    className: 'function-results-panel',
+    className: 'function-results-panel collapsed',
     styles: {
       display: 'none',
-      maxHeight: '200px',
-      overflow: 'auto',
+      overflow: 'hidden',
     },
     attributes: {
       'data-call-id': callId,
@@ -678,15 +386,8 @@ export const addExecuteButton = (blockDiv: HTMLDivElement, rawContent: string): 
 
   // Create optimized loading indicator
   const loadingIndicator = createOptimizedElement('div', {
-    className: 'function-loading',
-    styles: {
-      display: 'none',
-      marginTop: '12px',
-      padding: '10px',
-      borderRadius: '8px',
-      backgroundColor: 'rgba(0, 0, 0, 0.03)',
-      border: '1px solid rgba(0, 0, 0, 0.06)',
-    },
+    className: 'function-results-loading',
+    textContent: 'Running…',
   }) as HTMLDivElement;
 
   // Cache DOM references for performance
@@ -697,6 +398,15 @@ export const addExecuteButton = (blockDiv: HTMLDivElement, rawContent: string): 
     // Batch button state changes
     executeButton.disabled = true;
     buttonText.style.display = 'none';
+
+    const fnBlock = blockDiv.closest('.function-block') as HTMLElement | null;
+    const setStatus = (s: 'running' | 'success' | 'error') => {
+      if (!fnBlock) return;
+      fnBlock.classList.remove('exec-running', 'exec-success', 'exec-error');
+      fnBlock.classList.add(`exec-${s}`);
+    };
+    setStatus('running');
+    const t0 = performance.now();
 
     // Add spinner efficiently
     const spinner = createOptimizedElement('span', {
@@ -731,6 +441,7 @@ export const addExecuteButton = (blockDiv: HTMLDivElement, rawContent: string): 
 
       if (!mcpClient) {
         resetButtonState();
+        setStatus('error');
         displayResult(resultsPanel, loadingIndicator, false, 'Error: mcpClient not found');
         resultsPanel.style.display = 'block';
         return;
@@ -739,6 +450,7 @@ export const addExecuteButton = (blockDiv: HTMLDivElement, rawContent: string): 
       // Check if mcpClient is ready
       if (!mcpClient.isReady || !mcpClient.isReady()) {
         resetButtonState();
+        setStatus('error');
         displayResult(resultsPanel, loadingIndicator, false, 'Error: MCP client not ready');
         resultsPanel.style.display = 'block';
         return;
@@ -749,6 +461,7 @@ export const addExecuteButton = (blockDiv: HTMLDivElement, rawContent: string): 
       // Show results panel and loading indicator
       resultsPanel.style.display = 'block';
       resultsPanel.innerHTML = '';
+      loadingIndicator.style.display = '';
       resultsPanel.appendChild(loadingIndicator);
 
       // Call tool using the new mcpClient async API
@@ -756,7 +469,8 @@ export const addExecuteButton = (blockDiv: HTMLDivElement, rawContent: string): 
         const result = await mcpClient.callTool(functionName, parameters);
 
         resetButtonState();
-        displayResult(resultsPanel, loadingIndicator, true, result);
+        setStatus('success');
+        displayResult(resultsPanel, loadingIndicator, true, result, performance.now() - t0);
 
         // Store execution and update history efficiently
         const executionData = storeExecutedFunction(functionName, callId, parameters, contentSignature);
@@ -781,7 +495,22 @@ export const addExecuteButton = (blockDiv: HTMLDivElement, rawContent: string): 
           errorMessage = 'MCP server is unavailable. Please check the server status.';
         }
 
-        displayResult(resultsPanel, loadingIndicator, false, errorMessage);
+        setStatus('error');
+        displayResult(resultsPanel, loadingIndicator, false, errorMessage, performance.now() - t0);
+
+        // Return the failure to the model too, as its own tool-result chip, so a
+        // partially-failing multi-call batch still reports every call's outcome.
+        // (Pre-flight failures above — no mcpClient / not ready — deliberately do not.)
+        scheduleWork(() => {
+          document.dispatchEvent(
+            new CustomEvent('mcp:tool-execution-complete', {
+              detail: {
+                result: `<function_result call_id="${callId}">\nERROR: ${errorMessage}\n</function_result>`,
+                skipAutoInsertCheck: false,
+              },
+            }),
+          );
+        });
       }
 
     } catch (error: any) {
@@ -791,11 +520,13 @@ export const addExecuteButton = (blockDiv: HTMLDivElement, rawContent: string): 
       const errorMessage = error instanceof Error ? error.message : String(error);
       logger.error('Execute button error:', error);
 
+      setStatus('error');
       displayResult(
         resultsPanel,
         loadingIndicator,
         false,
         `Unexpected error: ${errorMessage}`,
+        performance.now() - t0,
       );
     }
   };
@@ -1045,7 +776,7 @@ const attachResultAsFile = async (
               if (typeof adapter.insertTextIntoInput === 'function') {
                 try {
                   // Dispatch event for legacy insertion
-                  requestAnimationFrame(() => {
+                  scheduleWork(() => {
                     document.dispatchEvent(
                       new CustomEvent('mcp:tool-execution-complete', {
                         detail: {
@@ -1065,7 +796,7 @@ const attachResultAsFile = async (
           } else if (typeof adapter.insertTextIntoInput === 'function') {
             // Use legacy method directly
             try {
-              requestAnimationFrame(() => {
+              scheduleWork(() => {
                 document.dispatchEvent(
                   new CustomEvent('mcp:tool-execution-complete', {
                     detail: {
@@ -1093,7 +824,7 @@ const attachResultAsFile = async (
           };
 
           // Use requestAnimationFrame for better performance
-          requestAnimationFrame(() => {
+          scheduleWork(() => {
             document.dispatchEvent(new CustomEvent('mcp:tool-execution-complete', { detail: eventDetail }));
           });
 
@@ -1121,7 +852,7 @@ const attachResultAsFile = async (
             if (typeof adapter.insertTextIntoInput === 'function') {
               try {
                 // Dispatch event for legacy insertion
-                requestAnimationFrame(() => {
+                scheduleWork(() => {
                   document.dispatchEvent(
                     new CustomEvent('mcp:tool-execution-complete', {
                       detail: {
@@ -1141,7 +872,7 @@ const attachResultAsFile = async (
         } else if (typeof adapter.insertTextIntoInput === 'function') {
           // Use legacy method directly
           try {
-            requestAnimationFrame(() => {
+            scheduleWork(() => {
               document.dispatchEvent(
                 new CustomEvent('mcp:tool-execution-complete', {
                   detail: {
@@ -1167,7 +898,7 @@ const attachResultAsFile = async (
           skipAutoInsertCheck,
         };
 
-        requestAnimationFrame(() => {
+        scheduleWork(() => {
           document.dispatchEvent(new CustomEvent('mcp:tool-execution-complete', { detail: eventDetail }));
         });
 
@@ -1193,7 +924,7 @@ const attachResultAsFile = async (
           if (typeof adapter.insertTextIntoInput === 'function') {
             try {
               // Dispatch event for legacy insertion
-              requestAnimationFrame(() => {
+              scheduleWork(() => {
                 document.dispatchEvent(
                   new CustomEvent('mcp:tool-execution-complete', {
                     detail: {
@@ -1213,7 +944,7 @@ const attachResultAsFile = async (
       } else if (typeof adapter.insertTextIntoInput === 'function') {
         // Use legacy method directly
         try {
-          requestAnimationFrame(() => {
+          scheduleWork(() => {
             document.dispatchEvent(
               new CustomEvent('mcp:tool-execution-complete', {
                 detail: {
@@ -1239,7 +970,7 @@ const attachResultAsFile = async (
         skipAutoInsertCheck,
       };
 
-      requestAnimationFrame(() => {
+      scheduleWork(() => {
         document.dispatchEvent(new CustomEvent('mcp:tool-execution-complete', { detail: eventDetail }));
       });
 
@@ -1269,6 +1000,7 @@ export const displayResult = (
   loadingIndicator: HTMLDivElement,
   success: boolean,
   result: any,
+  durationMs?: number,
 ): void => {
   // Cache attributes for performance
   const callId = resultsPanel.getAttribute('data-call-id') || '';
@@ -1282,7 +1014,7 @@ export const displayResult = (
     }
 
     // Batch remove existing result content
-    const existingResults = resultsPanel.querySelectorAll('.function-result-success, .function-result-error');
+    const existingResults = resultsPanel.querySelectorAll('.function-result-success, .function-result-error, .result-header');
     existingResults.forEach(el => resultsPanel.removeChild(el));
 
     // Remove previous button container
@@ -1326,6 +1058,65 @@ export const displayResult = (
   // Clean up previous results
   cleanupPreviousResults();
   loadingIndicator.style.display = 'none';
+  resultsPanel.classList.add('collapsed');   // start compact on every (re)render
+
+  const CHEVRON =
+    '<svg class="result-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" ' +
+    'xmlns="http://www.w3.org/2000/svg"><path d="M8 10l4 4 4-4" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+  const makeSummaryHeader = (ok: boolean, copyText: string, charCount: number, errorInline?: string): HTMLDivElement => {
+    const header = createOptimizedElement('div', { className: 'result-header' }) as HTMLDivElement;
+
+    const left = createOptimizedElement('span', { className: 'result-header-left' });
+    left.appendChild(createOptimizedElement('span', { className: `result-status-dot ${ok ? 'ok' : 'err'}` }));
+    // Label: function name (or Result/Error), plus #callId when present.
+    const label = ok ? 'Result' : 'Error'; // the card header already names the tool
+    left.appendChild(createOptimizedElement('span', { className: 'result-label', textContent: label }));
+    if (callId) {
+      left.appendChild(createOptimizedElement('span', { className: 'result-callid', textContent: `#${callId}` }));
+    }
+    if (!ok && errorInline) {
+      left.appendChild(createOptimizedElement('span', { className: 'result-error-inline', textContent: errorInline }));
+    }
+    const metaBits: string[] = [];
+    metaBits.push(`${charCount.toLocaleString()} chars`);
+    if (typeof durationMs === 'number') metaBits.push(formatDuration(durationMs));
+    left.appendChild(createOptimizedElement('span', { className: 'result-meta', textContent: metaBits.join(' · ') }));
+
+    const right = createOptimizedElement('span', { className: 'result-header-right' });
+    const copyBtn = createOptimizedElement('button', {
+      className: 'result-copy-button',
+      textContent: 'Copy',
+      attributes: { title: 'Copy result to clipboard', type: 'button' },
+    }) as HTMLButtonElement;
+    copyBtn.onclick = async (e) => {
+      e.stopPropagation();
+      try { await navigator.clipboard.writeText(copyText); copyBtn.textContent = 'Copied'; }
+      catch { copyBtn.textContent = 'Failed'; }
+      setTimeout(() => (copyBtn.textContent = 'Copy'), 1500);
+    };
+    right.appendChild(copyBtn);
+
+    const toggleBtn = createOptimizedElement('button', {
+      className: 'result-toggle',
+      innerHTML: CHEVRON,
+      attributes: { title: 'Show details', type: 'button' },
+    }) as HTMLButtonElement;
+    const toggle = (e: Event) => {
+      e.stopPropagation();
+      const nowCollapsed = resultsPanel.classList.toggle('collapsed');
+      toggleBtn.title = nowCollapsed ? 'Show details' : 'Hide details';
+    };
+    toggleBtn.onclick = toggle;
+    // whole summary row is clickable to expand/collapse (matches function-name pattern)
+    header.onclick = toggle;
+    right.appendChild(toggleBtn);
+
+    header.appendChild(left);
+    header.appendChild(right);
+    return header;
+  };
 
   if (success) {
     // Optimized success result processing
@@ -1336,56 +1127,50 @@ export const displayResult = (
       className: 'function-result-success',
     });
 
-    // Process result data efficiently
-    if (typeof result === 'object') {
-      try {
-        // Check if result has the new format with content array
-        if (result && result.content && Array.isArray(result.content)) {
-          // Extract text from content array
-          const textParts = result.content
-            .filter((item: any) => item.type === 'text' && item.text)
-            .map((item: any) => item.text);
-
-          if (textParts.length > 0) {
-            rawResultText = textParts.join('\n');
-            resultContent.textContent = rawResultText;
-          } else {
-            // Fallback to full JSON if no text content found
-            rawResultText = JSON.stringify(result, null, 2);
-            const pre = createOptimizedElement('pre', {
-              textContent: rawResultText,
-              styles: {
-                fontFamily: 'inherit',
-                fontSize: '13px',
-                lineHeight: '1.5',
-                padding: '0',
-                margin: '0',
-              },
-            });
-            resultContent.appendChild(pre);
-          }
-        } else {
-          // Original object handling for backward compatibility
-          rawResultText = JSON.stringify(result, null, 2);
-          const pre = createOptimizedElement('pre', {
-            textContent: rawResultText,
-            styles: {
-              fontFamily: 'inherit',
-              fontSize: '13px',
-              lineHeight: '1.5',
-              padding: '0',
-              margin: '0',
-            },
-          });
-          resultContent.appendChild(pre);
-        }
-      } catch (e) {
-        rawResultText = String(result);
-        resultContent.textContent = rawResultText;
+    // Raw text: used verbatim for insert/attach/copy and the <function_result> wrapper (contract).
+    if (typeof result === 'object' && result !== null) {
+      if (result.content && Array.isArray(result.content)) {
+        const textParts = result.content
+          .filter((item: any) => item.type === 'text' && item.text)
+          .map((item: any) => item.text);
+        rawResultText = textParts.length > 0 ? textParts.join('\n') : JSON.stringify(result, null, 2);
+      } else {
+        rawResultText = JSON.stringify(result, null, 2);
       }
     } else {
       rawResultText = String(result);
-      resultContent.textContent = rawResultText;
+    }
+
+    // Display text: pretty-print when the raw text itself is JSON.
+    let displayText = rawResultText;
+    const trimmedResult = rawResultText.trim();
+    if (trimmedResult.startsWith('{') || trimmedResult.startsWith('[')) {
+      try {
+        displayText = JSON.stringify(JSON.parse(trimmedResult), null, 2);
+      } catch {
+        /* not JSON — keep as-is */
+      }
+    }
+
+    resultsPanel.appendChild(makeSummaryHeader(true, rawResultText, displayText.length));
+
+    const isTruncated = displayText.length > MAX_RESULT_DISPLAY_CHARS;
+    const pre = createOptimizedElement('pre', {
+      className: 'result-pre',
+      textContent: isTruncated ? displayText.slice(0, MAX_RESULT_DISPLAY_CHARS) : displayText,
+    });
+    resultContent.appendChild(pre);
+    if (isTruncated) {
+      const showAll = createOptimizedElement('button', {
+        className: 'result-show-all',
+        textContent: `Show all (${displayText.length.toLocaleString()} chars)`,
+        attributes: { type: 'button' },
+      }) as HTMLButtonElement;
+      showAll.onclick = () => {
+        pre.textContent = displayText;
+        showAll.remove();
+      };
+      resultContent.appendChild(showAll);
     }
 
     // Add result to panel
@@ -1489,7 +1274,7 @@ export const displayResult = (
               }, 2000);
 
               // Efficient event dispatch with requestAnimationFrame
-              requestAnimationFrame(() => {
+              scheduleWork(() => {
                 document.dispatchEvent(
                   new CustomEvent('mcp:tool-execution-complete', {
                     detail: {
@@ -1512,7 +1297,7 @@ export const displayResult = (
               logger.debug('Falling back to legacy insertTextIntoInput method');
 
               // Efficient event dispatch with requestAnimationFrame
-              requestAnimationFrame(() => {
+              scheduleWork(() => {
                 document.dispatchEvent(
                   new CustomEvent('mcp:tool-execution-complete', {
                     detail: {
@@ -1552,7 +1337,7 @@ export const displayResult = (
           logger.debug('Using legacy insertTextIntoInput method');
 
           // Efficient event dispatch with requestAnimationFrame
-          requestAnimationFrame(() => {
+          scheduleWork(() => {
             document.dispatchEvent(
               new CustomEvent('mcp:tool-execution-complete', {
                 detail: {
@@ -1663,7 +1448,7 @@ export const displayResult = (
                 if (typeof adapter.insertTextIntoInput === 'function') {
                   try {
                     // Dispatch event for legacy insertion
-                    requestAnimationFrame(() => {
+                    scheduleWork(() => {
                       document.dispatchEvent(
                         new CustomEvent('mcp:tool-execution-complete', {
                           detail: {
@@ -1683,7 +1468,7 @@ export const displayResult = (
             } else if (typeof adapter.insertTextIntoInput === 'function') {
               // Use legacy method directly
               try {
-                requestAnimationFrame(() => {
+                scheduleWork(() => {
                   document.dispatchEvent(
                     new CustomEvent('mcp:tool-execution-complete', {
                       detail: {
@@ -1717,7 +1502,7 @@ export const displayResult = (
       const wrappedResult = `<function_result call_id="${callId}">\n${rawResultText}\n</function_result>`;
 
       // Dispatch event - delays are handled by automation service
-      requestAnimationFrame(() => {
+      scheduleWork(() => {
         document.dispatchEvent(
           new CustomEvent('mcp:tool-execution-complete', {
             detail: {
@@ -1731,12 +1516,14 @@ export const displayResult = (
   } else {
     // Optimized error result handling
     const errorMessage = processErrorMessage(result);
+    const inline = errorMessage.length > 120 ? errorMessage.slice(0, 120) + '…' : errorMessage;
 
     const resultContent = createOptimizedElement('div', {
       className: 'function-result-error',
       textContent: errorMessage,
     });
 
+    resultsPanel.appendChild(makeSummaryHeader(false, errorMessage, errorMessage.length, inline));
     resultsPanel.appendChild(resultContent);
   }
 };

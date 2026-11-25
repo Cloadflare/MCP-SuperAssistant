@@ -1,6 +1,7 @@
 import { BaseAdapterPlugin } from './base.adapter';
-import type { AdapterCapability, PluginContext } from '../plugin-types';
+import type { AdapterCapability, PluginContext, ChipAnchors } from '../plugin-types';
 import { createLogger } from '@extension/shared/lib/logger';
+import { inputChips } from '../../services/input-chips';
 
 /**
  * ChatGPT Adapter for OpenAI ChatGPT (chatgpt.com)
@@ -29,20 +30,23 @@ export class ChatGPTAdapter extends BaseAdapterPlugin {
   // Updated selectors based on current ChatGPT interface
   private readonly selectors = {
     // Primary chat input selector (ProseMirror contenteditable)
-    CHAT_INPUT: '#prompt-textarea, .ProseMirror[contenteditable="true"], div[contenteditable="true"][data-id*="prompt"]',
-    // Submit button selectors (multiple fallbacks)
-    SUBMIT_BUTTON: 'button[data-testid="send-button"], button[aria-label*="Send"], button[data-testid="fruitjuice-send-button"], button:has(svg) + button:has(svg[viewBox="0 0 20 20"])',
+    // Logged-out chatgpt.com renders a plain <textarea id="mobile-composer-prompt"> instead of ProseMirror.
+    CHAT_INPUT: '#prompt-textarea, .ProseMirror[contenteditable="true"], div[contenteditable="true"][data-id*="prompt"], textarea#mobile-composer-prompt',
+    // Submit button selectors (multiple fallbacks). Verified live Jan 2026: the send button only
+    // renders once the composer has text (an empty composer shows a dictation button instead).
+    // Kept selectors are combinator-free so they're safe inside inputChips' target.closest() interceptor.
+    SUBMIT_BUTTON: 'button[data-testid="send-button"], button#composer-submit-button, button[aria-label="Send"], button[aria-label="Send prompt"], button[aria-label*="Send"]',
     // File upload related selectors
-    FILE_UPLOAD_BUTTON: '#upload-file-btn, button[aria-label*="Add photos"], button[data-testid="composer-action-file-upload"] button',
+    FILE_UPLOAD_BUTTON: '#upload-file-btn, button[aria-label^="Add files"], button[aria-label*="Add photos"], button[data-testid="composer-action-file-upload"] button',
     FILE_INPUT: 'input[type="file"][multiple]',
     // Main panel and container selectors
-    MAIN_PANEL: 'main, .chat-container, [data-testid="conversation-turn-wrapper"]',
+    MAIN_PANEL: 'main, [role="region"][aria-label="Conversation"], .chat-container, [data-testid="conversation-turn-wrapper"]',
     // Drop zones for file attachment
-    DROP_ZONE: '#prompt-textarea, .ProseMirror, [data-testid="composer-text-input"], .composer-parent',
+    DROP_ZONE: '#prompt-textarea, .ProseMirror, [data-composer-body], [data-testid="composer-text-input"], .composer-parent',
     // File preview elements
     FILE_PREVIEW: '.file-preview, .attachment-preview, [data-testid="file-attachment"]',
     // Button insertion points (for MCP popover) - targeting leading area next to plus button
-    BUTTON_INSERTION_CONTAINER: '[grid-area="leading"], .composer-leading-actions, [data-testid="composer-plus-btn"]',
+    BUTTON_INSERTION_CONTAINER: '[grid-area="leading"], .composer-leading-actions, [data-testid="composer-plus-btn"], button[aria-label^="Add files"]',
     // Alternative insertion points
     FALLBACK_INSERTION: '.composer-parent, .relative.flex.w-full.items-end, [data-testid="composer-trailing-actions"]'
   };
@@ -131,6 +135,7 @@ export class ChatGPTAdapter extends BaseAdapterPlugin {
     // Clean up UI integration
     this.cleanupUIIntegration();
     this.cleanupDOMObservers();
+    inputChips.teardown();
 
     // Reset setup flags
     this.storeEventListenersSetup = false;
@@ -163,7 +168,8 @@ export class ChatGPTAdapter extends BaseAdapterPlugin {
     // Final cleanup
     this.cleanupUIIntegration();
     this.cleanupDOMObservers();
-    
+    inputChips.teardown();
+
     // Remove injected ChatGPT styles
     const styleElement = document.getElementById('mcp-chatgpt-button-styles');
     if (styleElement) {
@@ -182,7 +188,12 @@ export class ChatGPTAdapter extends BaseAdapterPlugin {
    * Insert text into the ChatGPT chat input field (ProseMirror editor)
    * Enhanced with better selector handling and event integration
    */
-  async insertText(text: string, options?: { targetElement?: HTMLElement }): Promise<boolean> {
+  async insertText(text: string, options?: { targetElement?: HTMLElement; source?: 'instructions' | 'tool-result' | 'capture' | 'tab-content' | 'unknown'; label?: string }): Promise<boolean> {
+    if (inputChips.tryCapture(this, text, options)) {
+      this.emitExecutionCompleted('insertText', { text }, { success: true, method: 'chip-capture' });
+      return true;
+    }
+
     this.context.logger.debug(`Attempting to insert text into ChatGPT chat input: ${text.substring(0, 50)}${text.length > 50 ? '...' : ''}`);
 
     let targetElement: HTMLElement | null = null;
@@ -208,53 +219,67 @@ export class ChatGPTAdapter extends BaseAdapterPlugin {
     }
 
     try {
-      // Store the original content
-      const originalContent = targetElement.textContent || '';
-
-      // Focus the input element
-      targetElement.focus();
-
-      // For ProseMirror editor, we need to handle the content differently
-      // Remove placeholder if present
-      const placeholder = targetElement.querySelector('[data-placeholder]');
-      if (placeholder) {
-        placeholder.remove();
+      if (targetElement instanceof HTMLTextAreaElement) {
+        // Logged-out composer: set the value through the native setter so the page's input
+        // binding sees it, then notify it.
+        const before = targetElement.value;
+        const next = before ? `${before}\n\n${text}` : text;
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(targetElement, next);
+        targetElement.dispatchEvent(new Event('input', { bubbles: true }));
+        targetElement.focus();
+        this.emitExecutionCompleted('insertText', { text }, { success: true, method: 'textarea' });
+        return true;
       }
 
-      // Create a new paragraph element with the text
-      const newContent = originalContent ? originalContent + '\n' + text : text;
-      
-      // Clear existing content and insert new content
-      targetElement.innerHTML = '';
-      const paragraph = document.createElement('p');
-      paragraph.textContent = newContent;
-      targetElement.appendChild(paragraph);
+      const before = targetElement.textContent || '';
 
-      // Position cursor at the end of the inserted text
+      // ChatGPT's composer is a ProseMirror contenteditable. A synthetic InputEvent or direct
+      // innerHTML write is NOT reliably reconciled into ProseMirror's internal document state
+      // (it can look right in the DOM yet submit empty). Instead we drive PM's native paste
+      // handler: move the caret to the end (so we append after any user-typed text), let PM's
+      // selectionchange observer adopt the DOM caret, then dispatch a paste ClipboardEvent.
+      // Verified live Jan 2026.
+      targetElement.focus();
       const range = document.createRange();
+      range.selectNodeContents(targetElement);
+      range.collapse(false); // caret at the very end
       const selection = window.getSelection();
-      if (selection && paragraph.firstChild) {
-        range.setStartAfter(paragraph.lastChild || paragraph);
-        range.collapse(true);
+      if (selection) {
         selection.removeAllRanges();
         selection.addRange(range);
+        document.dispatchEvent(new Event('selectionchange'));
+        // Give ProseMirror a tick to adopt the DOM caret before we paste into it.
+        await new Promise(r => setTimeout(r, 40));
       }
 
-      // Dispatch events to simulate user typing for better compatibility
-      targetElement.dispatchEvent(new Event('input', { bubbles: true }));
-      targetElement.dispatchEvent(new Event('change', { bubbles: true }));
-      targetElement.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }));
-      targetElement.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+      const dataTransfer = new DataTransfer();
+      dataTransfer.setData('text/plain', text);
+      targetElement.dispatchEvent(new ClipboardEvent('paste', {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: dataTransfer,
+      }));
+
+      // Verify on the next tick that content actually grew. ProseMirror can silently ignore a
+      // synthetic write; returning false lets the chip flush restore the chips rather than drop them.
+      await new Promise(r => setTimeout(r, 50));
+      const after = targetElement.textContent || '';
+      if (after.length <= before.length) {
+        this.context.logger.error('ChatGPT insertText no-op: ProseMirror content did not grow after paste');
+        this.emitExecutionFailed('insertText', 'ProseMirror did not accept inserted text');
+        return false;
+      }
 
       // Emit success event to the new event system
       this.emitExecutionCompleted('insertText', { text }, {
         success: true,
-        originalLength: originalContent.length,
+        method: 'prosemirror-paste',
+        originalLength: before.length,
         newLength: text.length,
-        totalLength: newContent.length
+        totalLength: after.length
       });
 
-      this.context.logger.debug(`Text inserted successfully. Original: ${originalContent.length}, Added: ${text.length}, Total: ${newContent.length}`);
+      this.context.logger.debug(`Text inserted successfully. Original: ${before.length}, Added: ${text.length}, Total: ${after.length}`);
       return true;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -264,11 +289,30 @@ export class ChatGPTAdapter extends BaseAdapterPlugin {
     }
   }
 
+  getChipAnchors(): ChipAnchors | null {
+    let input: HTMLElement | null = null;
+    for (const sel of this.selectors.CHAT_INPUT.split(', ')) {
+      input = document.querySelector(sel.trim()) as HTMLElement | null;
+      if (input) break;
+    }
+    if (!input) return null;
+    // The <form> wraps both the ProseMirror input and the action buttons (plus/send) and has
+    // overflow: visible, so prepending the chip bar sits it above the input without being clipped.
+    const form = input.closest('form');
+    // The logged-out composer form is a grid with named areas; an extra child reflows it, so
+    // put the chip bar just above the form instead.
+    const container = (form?.matches('[data-logged-out]') ? form.parentElement : form ?? input.parentElement) as HTMLElement | null;
+    if (!container) return null;
+    return { input, container, submitButtonSelector: this.selectors.SUBMIT_BUTTON };
+  }
+
   /**
    * Submit the current text in the ChatGPT chat input
    * Enhanced with multiple selector fallbacks and better error handling
    */
   async submitForm(options?: { formElement?: HTMLFormElement }): Promise<boolean> {
+    await inputChips.flushBeforeSubmit(this);
+
     this.context.logger.debug('Attempting to submit ChatGPT chat input');
 
     let submitButton: HTMLButtonElement | null = null;
@@ -965,11 +1009,18 @@ export class ChatGPTAdapter extends BaseAdapterPlugin {
     }
   }
 
-  private findButtonInsertionPoint(): { container: Element; insertAfter: Element | null } | null {
+  private findButtonInsertionPoint(): { container: Element; insertAfter: Element | null; insertBefore?: Element } | null {
     this.context.logger.debug('Finding button insertion point for MCP popover next to plus button');
 
     // Try to find the plus button first
-    const plusButton = document.querySelector('[data-testid="composer-plus-btn"]');
+    // Nov 2026 UI dropped the data-testid; the button is now labelled "Add files and more".
+    const plusButton = document.querySelector('[data-testid="composer-plus-btn"], button[aria-label^="Add files"]');
+    // The logged-out composer overlays its "+" cell on the text box, so there is no room
+    // beside it; sit before the dictation button on the right instead.
+    const dictation = plusButton?.closest('form[data-logged-out]')?.querySelector('button[aria-label="Start dictation"]');
+    if (dictation?.parentElement) {
+      return { container: dictation.parentElement, insertAfter: dictation.previousElementSibling, insertBefore: dictation };
+    }
     if (plusButton && plusButton.parentElement) {
       this.context.logger.debug('Found plus button, inserting MCP button after it');
       return { container: plusButton.parentElement, insertAfter: plusButton };
@@ -1010,7 +1061,7 @@ export class ChatGPTAdapter extends BaseAdapterPlugin {
     return null;
   }
 
-  private injectMCPPopover(insertionPoint: { container: Element; insertAfter: Element | null }): void {
+  private injectMCPPopover(insertionPoint: { container: Element; insertAfter: Element | null; insertBefore?: Element }): void {
     this.context.logger.debug('Injecting MCP popover into ChatGPT interface');
 
     try {
@@ -1026,7 +1077,7 @@ export class ChatGPTAdapter extends BaseAdapterPlugin {
       reactContainer.style.display = 'inline-block';
       
       // Adjust margin based on container type
-      const { container, insertAfter } = insertionPoint;
+      const { container, insertAfter, insertBefore } = insertionPoint;
       if (container.matches('[grid-area="leading"]') || container.closest('[grid-area="leading"]')) {
         reactContainer.style.margin = '0 0 0 8px'; // More space from plus button
       } else {
@@ -1034,7 +1085,9 @@ export class ChatGPTAdapter extends BaseAdapterPlugin {
       }
 
       // Insert at appropriate location
-      if (insertAfter && insertAfter.parentNode === container) {
+      if (insertBefore && insertBefore.parentNode === container) {
+        container.insertBefore(reactContainer, insertBefore);
+      } else if (insertAfter && insertAfter.parentNode === container) {
         container.insertBefore(reactContainer, insertAfter.nextSibling);
         this.context.logger.debug('Inserted popover container after specified element');
       } else {

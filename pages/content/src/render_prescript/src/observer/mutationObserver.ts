@@ -1,7 +1,6 @@
 import { CONFIG } from '../core/config';
 import { debounce } from '../utils/index';
 import { renderFunctionCall, renderedFunctionBlocks, processedElements } from '../renderer/index';
-import { stabilizeBlock, unstabilizeBlock } from '../renderer/components';
 import {
   monitorNode,
   streamingObservers,
@@ -9,7 +8,6 @@ import {
   streamingLastUpdated,
   startProgressiveUpdates,
 } from './streamObserver';
-import type { StabilizedBlock } from '../core/types';
 import { streamingContentLengths } from '../parser/index';
 import {
   preExistingIncompleteBlocks,
@@ -61,6 +59,10 @@ export const processUpdateQueue = (): void => {
         streamingObservers.delete(blockId);
       }
       renderedFunctionBlocks.delete(blockId);
+      // Also drop per-segment cards (multi-call blocks render blockId-s1, blockId-s2, …).
+      Array.from(renderedFunctionBlocks.keys())
+        .filter(k => k.startsWith(`${blockId}-s`))
+        .forEach(k => renderedFunctionBlocks.delete(k));
       streamingLastUpdated.delete(blockId);
       if (window._stalledStreams) window._stalledStreams.delete(blockId);
       // Clean up keys starting with blockId- from streamingContentLengths
@@ -86,18 +88,7 @@ export const processUpdateQueue = (): void => {
   isProcessing = true;
   window._isProcessing = true;
 
-  const stabilizedBlocks = new Map<string, StabilizedBlock>();
-
   try {
-    // if (CONFIG.usePositionFixed) {
-    //     updateQueue.forEach((node, blockId) => {
-    //         const stabilized = stabilizeBlock(blockId);
-    //         if (stabilized) {
-    //             stabilizedBlocks.set(blockId, stabilized);
-    //         }
-    //     });
-    // }
-
     updateQueue.forEach((node, blockId) => {
       if (CONFIG.debug) logger.debug(`Processing update for block: ${blockId}`);
       renderFunctionCall(node as HTMLPreElement, { current: isProcessing });
@@ -115,13 +106,6 @@ export const processUpdateQueue = (): void => {
   } catch (e) {
     logger.error('Error processing update queue:', e);
   } finally {
-    // if (stabilizedBlocks.size > 0) {
-    //     setTimeout(() => {
-    //         stabilizedBlocks.forEach((stabilized) => {
-    //             unstabilizeBlock(stabilized);
-    //         });
-    //     }, CONFIG.stabilizeTimeout);
-    // }
     isProcessing = false;
     window._isProcessing = false;
   }
@@ -145,11 +129,25 @@ export const processFunctionCalls = (): number => {
   return processedCount;
 };
 
+// element -> textContent at which renderFunctionCall last declined it (not a tool call).
+const nonToolText = new WeakMap<Element, string>();
+
 /**
  * Check for unprocessed function calls in the document
  */
 export const checkForUnprocessedFunctionCalls = (): number => {
   let processedCount = 0;
+
+  // Sites that swap a code block's element after hydration (ChatGPT renders a placeholder, then the
+  // final data-code-block node) leave the first card behind with no source; the new node gets its own
+  // card below, so drop cards whose source is gone. Multi-call cards use `${blockId}-s${i}`.
+  document.querySelectorAll<HTMLElement>('.function-block[data-block-id^="block-"]').forEach(card => {
+    // Fast path: the card's own source is still attached. Only fall back to the document-wide
+    // query (O(DOM) per card) when it isn't, e.g. the site replaced it with a same-id node.
+    if (card._mcpSource?.isConnected) return;
+    const sourceId = card.getAttribute('data-block-id')!.replace(/-s\d+$/, '');
+    if (!document.querySelector(`[data-block-id="${sourceId}"]:not(.function-block)`)) card.remove();
+  });
 
   // Get all pre/code elements in the document that might contain function calls
   const getTargetElements = (): HTMLElement[] => {
@@ -165,6 +163,10 @@ export const checkForUnprocessedFunctionCalls = (): number => {
   const elements = getTargetElements();
   for (const element of elements) {
     if (!processedElements.has(element) && !element.closest('.function-block')) {
+      // Ordinary code blocks never enter processedElements; skip re-parsing them until their text changes.
+      const text = element.textContent ?? '';
+      if (nonToolText.get(element) === text) continue;
+
       const blockId =
         element.getAttribute('data-block-id') || `block-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
 
@@ -172,12 +174,22 @@ export const checkForUnprocessedFunctionCalls = (): number => {
       if (result) {
         processedCount++;
         monitorNode(element, blockId);
+      } else if (!processedElements.has(element)) {
+        nonToolText.set(element, text);
       }
     }
   }
 
   return processedCount;
 };
+
+// XML or (lenient, possibly partial/streaming) JSON function-call text. textContent is read once by
+// the caller; the regex avoids trim() copying large subtrees' text.
+const hasCallPattern = (text: string, allowArray = false): boolean =>
+  text.includes('<function_calls>') ||
+  text.includes('<invoke') ||
+  (text.includes('"type"') && (text.includes('function_call') || text.includes('parameter'))) ||
+  (text.length < 50 && (allowArray ? /^\s*[{[]/ : /^\s*\{/).test(text));
 
 /**
  * Start direct monitoring of content for function calls
@@ -206,97 +218,49 @@ export const startDirectMonitoring = (): void => {
 
   // Create a mutation observer to watch for changes to the DOM
   functionCallObserver = new MutationObserver(mutations => {
+    const targetSel = CONFIG.targetSelectors;
+    const targetSelJoined = targetSel.join(',');
+    const streamSel = CONFIG.streamingContainerSelectors;
+    const streamSelJoined = streamSel.join(',');
     let shouldProcess = false;
     let potentialFunctionCall = false;
 
     for (const mutation of mutations) {
+      // Per-block observers own already-monitored subtrees; the doc observer only needs
+      // to detect *new* blocks. Skip mutations inside a monitored node or rendered block
+      // so streaming chunks don't trigger a full-document rescan (O(n²) with chat length).
+      const t: Node = mutation.target;
+      const el = t.nodeType === Node.ELEMENT_NODE ? (t as Element) : t.parentElement;
+      if (el && (el.closest('[data-monitored-node]') || el.closest('.function-block'))) continue;
+
       // Check if any added nodes might contain function calls
       if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
         for (const node of Array.from(mutation.addedNodes)) {
           if (node.nodeType === Node.ELEMENT_NODE) {
             const element = node as Element;
+            if (element.classList.contains('function-block')) continue; // our own card
 
-            // Check for target elements or containers
-            const isTargetElement = CONFIG.targetSelectors.some(selector => element.matches(selector));
-
-            const hasTargetElements = element.querySelectorAll(CONFIG.targetSelectors.join(',')).length > 0;
-
-            // Check for streaming container elements
-            const isStreamingContainer = CONFIG.streamingContainerSelectors.some(selector => element.matches(selector));
-
-            const hasStreamingContainers =
-              element.querySelectorAll(CONFIG.streamingContainerSelectors.join(',')).length > 0;
-
-            // Also check if the content of any text nodes might contain function call patterns (XML or JSON)
-            if (element.textContent) {
-              const hasXMLPattern =
-                element.textContent.includes('<function_calls>') ||
-                element.textContent.includes('<invoke');
-
-              // Be lenient for JSON - allow partial/streaming content
-              const looksLikeJSONStart = element.textContent.trim().startsWith('{');
-              const hasJSONPattern =
-                (element.textContent.includes('"type"') &&
-                  (element.textContent.includes('function_call') || element.textContent.includes('parameter'))) ||
-                (looksLikeJSONStart && element.textContent.length < 50);
-
-              if (hasXMLPattern || hasJSONPattern) {
-                potentialFunctionCall = true;
-              }
-            }
-
+            // Cheapest checks first; querySelector stops at the first match (querySelectorAll walked all).
             if (
-              isTargetElement ||
-              hasTargetElements ||
-              isStreamingContainer ||
-              hasStreamingContainers ||
-              potentialFunctionCall
+              targetSel.some(sel => element.matches(sel)) ||
+              element.querySelector(targetSelJoined) ||
+              streamSel.some(sel => element.matches(sel)) ||
+              element.querySelector(streamSelJoined) ||
+              hasCallPattern(element.textContent || '')
             ) {
-              shouldProcess = true;
-              break;
-            }
-          } else if (node.nodeType === Node.TEXT_NODE) {
-            // Also check text nodes for function call patterns (XML or JSON)
-            const textContent = node.textContent || '';
-
-            const hasXMLPattern =
-              textContent.includes('<function_calls>') ||
-              textContent.includes('<invoke');
-
-            // Be lenient for JSON - allow partial/streaming content
-            const looksLikeJSONStart = textContent.trim().startsWith('{');
-            const hasJSONPattern =
-              (textContent.includes('"type"') &&
-                (textContent.includes('function_call') || textContent.includes('parameter'))) ||
-              (looksLikeJSONStart && textContent.length < 50);
-
-            if (hasXMLPattern || hasJSONPattern) {
               potentialFunctionCall = true;
               shouldProcess = true;
               break;
             }
+          } else if (node.nodeType === Node.TEXT_NODE && hasCallPattern(node.textContent || '')) {
+            potentialFunctionCall = true;
+            shouldProcess = true;
+            break;
           }
         }
-      } else if (mutation.type === 'characterData') {
-        // Check if the characterData mutation might be adding function call content (XML or JSON)
-        const textContent = mutation.target.textContent || '';
-
-        const hasXMLPattern =
-          textContent.includes('<function_calls>') ||
-          textContent.includes('<invoke');
-
-        // Be lenient for JSON detection - allow partial/streaming content
-        // Check if it looks like JSON start, not just complete patterns
-        const looksLikeJSONStart = textContent.trim().startsWith('{') || textContent.trim().startsWith('[');
-        const hasJSONPattern =
-          (textContent.includes('"type"') &&
-            (textContent.includes('function_call') || textContent.includes('parameter'))) ||
-          (looksLikeJSONStart && textContent.length < 50); // Allow short JSON-like content
-
-        if (hasXMLPattern || hasJSONPattern) {
-          potentialFunctionCall = true;
-          shouldProcess = true;
-        }
+      } else if (mutation.type === 'characterData' && hasCallPattern(mutation.target.textContent || '', true)) {
+        potentialFunctionCall = true;
+        shouldProcess = true;
       }
 
       if (shouldProcess) break;
@@ -306,7 +270,11 @@ export const startDirectMonitoring = (): void => {
       if (potentialFunctionCall && CONFIG.debug) {
         logger.debug('Potential function call detected, processing DOM changes');
       }
-      handleDomChanges();
+      // MutationObserver callbacks run before the next paint: rendering here (not after a
+      // debounce) swaps raw call text for the card before it is ever painted. Already-rendered
+      // blocks are skipped above, so this only scans until a new block gets its card.
+      if (!isProcessing) checkForUnprocessedFunctionCalls();
+      else handleDomChanges();
     }
   });
 
@@ -315,7 +283,6 @@ export const startDirectMonitoring = (): void => {
     childList: true,
     subtree: true,
     characterData: true, // Also watch for text content changes
-    characterDataOldValue: true, // Keep old values for comparison
   });
 
   if (CONFIG.debug) logger.debug('Direct monitoring started for function calls');

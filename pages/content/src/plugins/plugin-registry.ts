@@ -29,6 +29,7 @@ import { ChatGPTAdapter } from './adapters/chatgpt.adapter';
 import { KimiAdapter } from './adapters/kimi.adapter';
 import { ZAdapter } from './adapters/z.adapter';
 import { QwenAdapter } from './adapters/qwenchat.adapter';
+import { ClaudeAdapter } from './adapters/claude.adapter';
 import { RemoteConfigPlugin } from './remote-config.plugin';
 
 
@@ -812,7 +813,8 @@ class PluginRegistry {
         name: 'grok-adapter',
         version: '2.0.0',
         type: 'website-adapter',
-        hostnames: ['grok.com', /x\.com.*grok/, /twitter\.com.*grok/],
+        // Matching is by hostname only, so x.com must match as a whole; GrokAdapter gates on the /i/grok path itself.
+        hostnames: ['grok.com', /^(www\.)?(x|twitter)\.com$/],
         capabilities: ['text-insertion', 'form-submission', 'file-attachment'],
         create: () => new GrokAdapter(),
         config: {
@@ -945,7 +947,7 @@ class PluginRegistry {
         name: 'kimi-adapter',
         version: '2.0.0',
         type: 'website-adapter',
-        hostnames: ['kimi.com'],
+        hostnames: ['kimi.com', 'kimi.ai'],
         capabilities: ['text-insertion', 'form-submission', 'file-attachment'],
         create: () => new KimiAdapter(),
         config: {
@@ -998,6 +1000,28 @@ class PluginRegistry {
           name: 'Qwen Adapter',
           description: 'Specialized adapter for Qwen AI with chat input, form submission, and file attachment support',
           version: '2.0.0',
+          enabled: true,
+          priority: 5,
+          settings: {
+            logLevel: 'info',
+            urlCheckInterval: 1000,
+          },
+        },
+      });
+
+      // Register ClaudeAdapter factory for Claude.ai
+      this.registerAdapterFactory({
+        name: 'claude-adapter',
+        version: '1.0.0',
+        type: 'website-adapter',
+        hostnames: ['claude.ai'],
+        capabilities: ['text-insertion', 'form-submission'],
+        create: () => new ClaudeAdapter(),
+        config: {
+          id: 'claude-adapter',
+          name: 'Claude Adapter',
+          description: 'Specialized adapter for Claude.ai with chat input and form submission support',
+          version: '1.0.0',
           enabled: true,
           priority: 5,
           settings: {
